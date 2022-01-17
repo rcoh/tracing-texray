@@ -19,7 +19,7 @@ In cases where a more powerful solution like [tracing-chrome](https://crates.io/
 `tracing-xray` combines two pieces: a global subscriber, and local span examination. 
 
 **First**, the layer must be installed globally:
-```no_run
+```rust,no_run
 use std::time::Duration;
 use tracing_texray::TeXRayLayer;
 use tracing_subscriber::{Registry, EnvFilter, layer::SubscriberExt};
