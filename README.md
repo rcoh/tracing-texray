@@ -19,7 +19,7 @@ In cases where a more powerful solution like [tracing-chrome](https://crates.io/
 
 `tracing-xray` combines two pieces: a global subscriber, and local span examination. By default, `tracing-xray` won't
 print anything—it just sits in the background. But: once a span is `examine`'d, `tracing-textray` will track the
-span and all of it's children. When it exists, span diagnostics will be printed to stderr (or another `impl io::Write`
+span and all of it's children. When the span exits, span diagnostics will be printed to stderr (or another `impl io::Write`
 as configured).
 
 **First**, the layer must be installed globally:
