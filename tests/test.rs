@@ -1,16 +1,14 @@
 use std::time::Duration;
 use tracing::info_span;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_texray::TeXRayLayer;
 
 #[test]
 fn test_me() {
-    tracing_texray::init();
-    tracing_texray::examine_with(
-        info_span!("load_data"),
-        tracing_texray::Settings::default()
-            .enable_events()
-            .width(80),
-    )
-    .in_scope(|| {
+    let layer = TeXRayLayer::new().width(80).enable_events();
+    let registry = tracing_subscriber::registry().with(layer);
+    tracing::subscriber::set_global_default(registry).expect("failed to install subscriber");
+    tracing_texray::examine(info_span!("load_data")).in_scope(|| {
         std::thread::sleep(Duration::from_millis(20));
         info_span!("download_results", uri = %"www.crates.io").in_scope(|| {
             tracing::info!("URI resolved");
@@ -25,4 +23,19 @@ fn test_me() {
             std::thread::sleep(Duration::from_millis(5));
         })
     });
+
+    somewhere_deep_in_my_program();
+}
+
+fn somewhere_deep_in_my_program() {
+    tracing_texray::examine(info_span!("do_a_thing")).in_scope(|| {
+        for id in 0..5 {
+            some_other_function(id);
+        }
+    })
+}
+
+fn some_other_function(id: usize) {
+    info_span!("inner_task", id = %id).in_scope(|| tracing::info!("buzz"));
+    // ...
 }

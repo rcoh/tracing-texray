@@ -25,6 +25,7 @@ use tracing_subscriber::registry::LookupSpan;
 use tracing_subscriber::{Layer, Registry};
 
 const NESTED_EVENT_OFFSET: usize = 2;
+const DURATION_WIDTH: usize = 6;
 
 #[derive(Debug, Clone)]
 struct EventInfo {
@@ -181,7 +182,7 @@ impl SpanInfo {
             out,
             " {:>dur_width$} ",
             pretty_duration(span_len),
-            dur_width = 6
+            dur_width = DURATION_WIDTH
         )?;
 
         let offset = width(
@@ -242,7 +243,7 @@ impl RenderConf {
     fn chart_width(&self) -> usize {
         self.width
             .checked_sub(self.key_width)
-            .and_then(|w| w.checked_sub(8))
+            .and_then(|w| w.checked_sub(DURATION_WIDTH + 2))
             .unwrap_or(20)
     }
 }
@@ -419,7 +420,7 @@ impl SpanTracker {
                     ev.timestamp.duration_since(span_info.start).unwrap(),
                 ) as i32)
                     - 1;
-                write!(out, "{}", " ".repeat(8))?;
+                write!(out, "{}", " ".repeat(DURATION_WIDTH + 2))?;
                 writeln!(
                     out,
                     "{}┼",
@@ -432,7 +433,12 @@ impl SpanTracker {
         children.sort_by_key(|child| child.info.as_ref().map(|it| it.start));
 
         for child in children {
-            child._dump(out, render_conf, settings, left_offset + 2)?;
+            child._dump(
+                out,
+                render_conf,
+                settings,
+                left_offset + NESTED_EVENT_OFFSET,
+            )?;
         }
         Ok(())
     }
@@ -470,16 +476,16 @@ pub struct Settings {
     types: Types,
     field_printing: FieldFilter,
     updated: bool,
-    out: WriterWrapper,
+    out: DynWriter,
 }
 
 /// Wrap a dyn writer to get a Debug implementation
 #[derive(Clone)]
-struct WriterWrapper {
+struct DynWriter {
     inner: Arc<Mutex<dyn std::io::Write + Send>>,
 }
 
-impl Debug for WriterWrapper {
+impl Debug for DynWriter {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(f, "dyn Writer")
     }
@@ -518,7 +524,7 @@ impl Default for Settings {
             },
             field_printing: Default::default(),
             updated: false,
-            out: WriterWrapper {
+            out: DynWriter {
                 inner: Arc::new(Mutex::new(stderr())),
             },
         }
@@ -550,7 +556,7 @@ impl Settings {
 
     /// Overwrite the writer [`TexRayLayer`] will output to
     pub fn writer<W: Write + Send + 'static>(mut self, w: W) -> Self {
-        self.out = WriterWrapper {
+        self.out = DynWriter {
             inner: Arc::new(Mutex::new(w)),
         };
         self
@@ -721,14 +727,6 @@ fn pretty_duration(duration: Duration) -> String {
         }
     }
     unreachable!("{:?}", duration)
-}
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn it_works() {
-        assert_eq!(2 + 2, 4);
-    }
 }
 
 impl<S> Layer<S> for TeXRayLayer

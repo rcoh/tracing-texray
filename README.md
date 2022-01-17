@@ -1,7 +1,7 @@
 # tracing-texray
 
-`tracing-texray` is a tracing layer to introspect tracing spans and events in plain text. By `examine`-ing
-a specific span, a full tree will be dumped when that span exits. Example output:
+`tracing-texray` is a tracing layer to introspect tracing spans and events in plain text. By `examine`-ing a specific
+span, a full tree will be dumped when that span exits. Example output:
 
 ```text
 load_data                                52ms ├────────────────────────────────┤
@@ -16,9 +16,14 @@ In cases where a more powerful solution like [tracing-chrome](https://crates.io/
 `tracing-texray` can render lightweight timeline of what happened when.
 
 ## Usage
-`tracing-xray` combines two pieces: a global subscriber, and local span examination. 
+
+`tracing-xray` combines two pieces: a global subscriber, and local span examination. By default, `tracing-xray` won't
+print anything—it just sits in the background. But: once a span is `examine`'d, `tracing-textray` will track the
+span and all of it's children. When it exists, span diagnostics will be printed to stderr (or another `impl io::Write`
+as configured).
 
 **First**, the layer must be installed globally:
+
 ```rust,no_run
 use std::time::Duration;
 use tracing_texray::TeXRayLayer;
@@ -44,16 +49,36 @@ fn main() {
 ```
 
 **Next**, wrap any spans you want to track with `examine`:
+
 ```rust
 use tracing::info_span;
 use tracing_texray::examine;
+
 fn somewhere_deep_in_my_program() {
-    examine(info_span!("do_a_thing")).in_scope(|| {
-        some_other_function();
+    tracing_texray::examine(info_span!("do_a_thing")).in_scope(|| {
+        for id in 0..5 {
+            some_other_function(id);
+        }
     })
 }
 
-fn some_other_function() {
+fn some_other_function(id: usize) {
+    info_span!("inner_task", id = %id).in_scope(|| tracing::info!("buzz"));
     // ...
 }
+```
+
+When the `do_a_thing` span exits, output like the following will be printed: 
+```text
+do_a_thing           603μs ├───────────────────────────────────────────────────┤
+  inner_task{id: 0}   82μs                ├─────┤
+  >buzz                                      ┼
+  inner_task{id: 1}   36μs                           ├─┤
+  >buzz                                              ┼
+  inner_task{id: 2}   34μs                                  ├─┤
+  >buzz                                                     ┼
+  inner_task{id: 3}   37μs                                           ├─┤
+  >buzz                                                              ┼
+  inner_task{id: 4}   35μs                                                  ├─┤
+  >buzz                                                                     ┼
 ```
