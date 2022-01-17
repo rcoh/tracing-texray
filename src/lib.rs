@@ -9,8 +9,10 @@
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
-use std::fmt::{Debug, Write};
-use std::sync::{Arc, RwLock};
+use std::fmt::{Debug, Formatter};
+use std::io::{stderr, Write};
+use std::ops::DerefMut;
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, SystemTime};
 use tracing::field::{Field, Visit};
 use tracing::span::{Attributes, Record};
@@ -105,7 +107,7 @@ struct TrackedMetadata {
 }
 
 impl TrackedMetadata {
-    fn write(&self, f: &mut impl Write, settings: &Settings) -> std::fmt::Result {
+    fn write(&self, f: &mut impl std::fmt::Write, settings: &Settings) -> std::fmt::Result {
         let relevant_fields = || {
             self.data
                 .iter()
@@ -151,12 +153,12 @@ impl SpanInfo {
 
     fn render(
         &self,
-        out: &mut impl Write,
+        out: &mut dyn Write,
         tracker: &SpanTracker,
         settings: &Settings,
         render_conf: &RenderConf,
         left_offset: usize,
-    ) -> std::fmt::Result {
+    ) -> std::io::Result<()> {
         let mut key = self.full_name(tracker, settings);
         let truncated_key_width = render_conf.key_width - left_offset;
         key.truncate(truncated_key_width);
@@ -340,14 +342,13 @@ impl SpanTracker {
         longest_self.max(longest_child)
     }
 
-    fn dump(&self, settings: &Settings) -> String {
+    fn dump(&self, settings: &Settings) -> std::io::Result<()> {
         let settings = self.settings.as_ref().unwrap_or(settings);
-        let mut out = String::new();
-        self.dump_to(&mut out, settings).unwrap();
-        out
+        let mut out = settings.out.inner.lock().unwrap();
+        self.dump_to(out.deref_mut(), settings)
     }
 
-    fn dump_to(&self, w: &mut impl Write, settings: &Settings) -> std::fmt::Result {
+    fn dump_to(&self, w: &mut dyn Write, settings: &Settings) -> std::io::Result<()> {
         let all_events = self.events().collect::<Vec<_>>();
         if all_events.is_empty() {
             return Ok(());
@@ -375,11 +376,11 @@ impl SpanTracker {
 
     fn _dump(
         &self,
-        out: &mut impl Write,
+        out: &mut dyn Write,
         render_conf: &RenderConf,
         settings: &Settings,
         left_offset: usize,
-    ) -> std::fmt::Result {
+    ) -> std::io::Result<()> {
         let span_info = match &self.info {
             Some(info) => info,
             /* span never got data */
@@ -469,6 +470,19 @@ pub struct Settings {
     types: Types,
     field_printing: FieldFilter,
     updated: bool,
+    out: WriterWrapper,
+}
+
+/// Wrap a dyn writer to get a Debug implementation
+#[derive(Clone)]
+struct WriterWrapper {
+    inner: Arc<Mutex<dyn std::io::Write + Send>>,
+}
+
+impl Debug for WriterWrapper {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "dyn Writer")
+    }
 }
 
 /// Filter to control which fields are printed along with spans
@@ -504,6 +518,9 @@ impl Default for Settings {
             },
             field_printing: Default::default(),
             updated: false,
+            out: WriterWrapper {
+                inner: Arc::new(Mutex::new(stderr())),
+            },
         }
     }
 }
@@ -516,21 +533,11 @@ impl Settings {
     /// - Only spans are printed, events are not
     /// - Spans of any duration are printed
     pub fn auto() -> Self {
-        let width = if let Some((w, _h)) = term_size::dimensions() {
-            w
-        } else {
-            120
+        let mut base = Settings::default();
+        if let Some((w, _h)) = term_size::dimensions() {
+            base.width = w;
         };
-        Self {
-            width,
-            min_duration: None,
-            types: Types {
-                spans: true,
-                events: false,
-            },
-            field_printing: Default::default(),
-            updated: true,
-        }
+        base
     }
 
     /// Set the max-width when printing output
@@ -538,6 +545,14 @@ impl Settings {
     pub fn width(mut self, width: usize) -> Self {
         self.width = width;
         self.updated = true;
+        self
+    }
+
+    /// Overwrite the writer [`TexRayLayer`] will output to
+    pub fn writer<W: Write + Send + 'static>(mut self, w: W) -> Self {
+        self.out = WriterWrapper {
+            inner: Arc::new(Mutex::new(w)),
+        };
         self
     }
 
@@ -757,7 +772,7 @@ where
             tracker.exit(&id, tracker.path(&id, &ctx), SystemTime::now())
         });
         if let Some(tracker) = self.tracked_spans.read().unwrap().get(&id) {
-            println!("{}", tracker.dump(self.settings()));
+            let _ = tracker.dump(self.settings());
         }
     }
 }
@@ -800,6 +815,13 @@ mod test {
         }
     }
 
+    fn dump_to_string(tracker: &SpanTracker) -> String {
+        let mut out = vec![];
+        let settings = Settings::default();
+        tracker.dump_to(&mut out, &settings).unwrap();
+        String::from_utf8(out.clone()).unwrap()
+    }
+
     #[test]
     fn render_correct_output() {
         let id_0 = Id::from_u64(1);
@@ -834,7 +856,7 @@ mod test {
         }
         tracker.exit(&id_0, iter::empty(), interval_end);
         let settings = Settings::default();
-        let output = tracker.dump(&settings);
+        let output = dump_to_string(&tracker);
         assert_eq!(output, r#"
 test       10s  ├──────────────────────────────────────────────────────────────────────────────────────────────────────┤
   nested    5s                       ├──────────────────────────────────────────────────┤
