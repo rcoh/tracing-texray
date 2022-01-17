@@ -1,5 +1,7 @@
 # tracing-texray
 
+> First, a word of warning: **This is alpha software.** Don't run this in prod or anywhere where a panic would be ruin your day.
+
 `tracing-texray` is a tracing layer to introspect tracing spans and events in plain text. By `examine`-ing a specific
 span, a full tree will be dumped when that span exits. Example output:
 
