@@ -6,8 +6,8 @@ span, a full tree will be dumped when that span exits. Example output:
 ```text
 load_data                                52ms ├────────────────────────────────┤
   download_results{uri: www.crates.io}   11ms                ├─────┤
-  >URI resolved                                              ┼
-  >connected                                                    ┼
+   >URI resolved                                             ┼
+   >connected                                                   ┼
   compute_stats                          10ms                        ├─────┤
   render_response                         6ms                               ├──┤
 ```
@@ -70,15 +70,15 @@ fn some_other_function(id: usize) {
 
 When the `do_a_thing` span exits, output like the following will be printed: 
 ```text
-do_a_thing           603μs ├───────────────────────────────────────────────────┤
-  inner_task{id: 0}   82μs                ├─────┤
-  >buzz                                      ┼
-  inner_task{id: 1}   36μs                           ├─┤
-  >buzz                                              ┼
-  inner_task{id: 2}   34μs                                  ├─┤
-  >buzz                                                     ┼
-  inner_task{id: 3}   37μs                                           ├─┤
-  >buzz                                                              ┼
-  inner_task{id: 4}   35μs                                                  ├─┤
-  >buzz                                                                     ┼
+do_a_thing           509μs ├───────────────────────────────────────────────────┤
+  inner_task{id: 0}   92μs         ├────────┤
+   >buzz                             ┼
+  inner_task{id: 1}   36μs                       ├──┤
+   >buzz                                         ┼
+  inner_task{id: 2}   35μs                               ├──┤
+   >buzz                                                 ┼
+  inner_task{id: 3}   36μs                                         ├──┤
+   >buzz                                                           ┼
+  inner_task{id: 4}   35μs                                                 ├──┤
+   >buzz                                                                   ┼
 ```

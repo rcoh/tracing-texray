@@ -393,7 +393,7 @@ impl SpanTracker {
         }
 
         if settings.types.events {
-            let left_offset = left_offset + 1;
+            let left_offset = left_offset + 2;
             let truncated_key_width = render_conf.key_width - left_offset;
             let base_offset = width(
                 render_conf.chart_width(),
