@@ -13,7 +13,7 @@ load_data                                52ms ├──────────�
 ```
 
 In cases where a more powerful solution like [tracing-chrome](https://crates.io/crates/tracing-chrome) is not required,
-`tracing-texray` gives enables getting a lightweight timeline of what happened when.
+`tracing-texray` can render lightweight timeline of what happened when.
 
 ## Usage
 `tracing-xray` combines two pieces: a global subscriber, and local span examination. 
