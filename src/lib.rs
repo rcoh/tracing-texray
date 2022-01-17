@@ -1,3 +1,12 @@
+#![doc = include_str!("../README.md")]
+#![warn(
+    missing_docs,
+    rustdoc::missing_crate_level_docs,
+    missing_debug_implementations,
+    rust_2018_idioms,
+    unreachable_pub
+)]
+
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::fmt::{Debug, Write};
@@ -191,11 +200,12 @@ impl SpanInfo {
     }
 }
 
+#[derive(Debug)]
 struct SpanTracker {
     span_id: span::Id,
     info: Option<SpanInfo>,
     metadata: TrackedMetadata,
-    explicit_events: Vec<EventInfo>,
+    events: Vec<EventInfo>,
     children: HashMap<span::Id, SpanTracker>,
     settings: Option<Settings>,
 }
@@ -240,7 +250,7 @@ impl SpanTracker {
         Self {
             span_id: id,
             info: None,
-            explicit_events: vec![],
+            events: vec![],
             metadata: Default::default(),
             children: Default::default(),
             settings,
@@ -264,7 +274,7 @@ impl SpanTracker {
         path: impl Iterator<Item = span::Id>,
         event: EventInfo,
     ) {
-        self._with_tracker(span, path, |tracker| tracker.explicit_events.push(event));
+        self._with_tracker(span, path, |tracker| tracker.events.push(event));
     }
 
     fn open(&mut self, span: &span::Id, path: impl Iterator<Item = span::Id>, span_info: SpanInfo) {
@@ -330,14 +340,14 @@ impl SpanTracker {
         longest_self.max(longest_child)
     }
 
-    pub fn dump(&self, settings: &Settings) -> String {
+    fn dump(&self, settings: &Settings) -> String {
         let settings = self.settings.as_ref().unwrap_or(settings);
         let mut out = String::new();
         self.dump_to(&mut out, settings).unwrap();
         out
     }
 
-    pub fn dump_to(&self, w: &mut impl Write, settings: &Settings) -> std::fmt::Result {
+    fn dump_to(&self, w: &mut impl Write, settings: &Settings) -> std::fmt::Result {
         let all_events = self.events().collect::<Vec<_>>();
         if all_events.is_empty() {
             return Ok(());
@@ -395,7 +405,7 @@ impl SpanTracker {
             if let FieldFilter::AllowList(list) = &mut settings_with_message.field_printing {
                 list.insert("message".into());
             }
-            for ev in &self.explicit_events {
+            for ev in &self.events {
                 let mut key = ev.to_string(&settings_with_message);
                 key.truncate(truncated_key_width);
                 if left_offset >= 1 {
@@ -451,6 +461,7 @@ struct Types {
     spans: bool,
 }
 
+/// Settings for [`TeXRayLayer`] output
 #[derive(Clone, Debug)]
 pub struct Settings {
     width: usize,
@@ -522,6 +533,14 @@ impl Settings {
         }
     }
 
+    /// Set the max-width when printing output
+    #[must_use]
+    pub fn width(mut self, width: usize) -> Self {
+        self.width = width;
+        self.updated = true;
+        self
+    }
+
     /// Print events in addition to spans
     #[must_use]
     pub fn enable_events(mut self) -> Self {
@@ -530,7 +549,7 @@ impl Settings {
         self
     }
 
-    /// When printing spans & events, only render the following fields when present
+    /// When printing spans & events, only render the following fields
     #[must_use]
     pub fn only_show_fields(mut self, fields: &[&'static str]) -> Self {
         self.field_printing =
@@ -558,7 +577,7 @@ impl Settings {
 ///
 /// _Note:_ This layer does nothing on its own. It must be used in combination with [`examine`] to
 /// print the summary of a specific span.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct TeXRayLayer {
     tracked_spans: Arc<RwLock<HashMap<span::Id, SpanTracker>>>,
     settings: Settings,
@@ -580,6 +599,7 @@ impl TeXRayLayer {
         }
     }
 
+    /// Create a new [`TeXRayLayer`] with settings from [`Settings::auto`]
     pub fn new() -> Self {
         let mut dumper = DUMPER.clone();
         if !dumper.settings.updated {
@@ -592,6 +612,7 @@ impl TeXRayLayer {
         &self.settings
     }
 
+    /// Show events in output in addition to spans
     pub fn enable_events(self) -> Self {
         Self {
             settings: self.settings.enable_events(),
@@ -599,22 +620,35 @@ impl TeXRayLayer {
         }
     }
 
-    pub fn only_with_fields(mut self, fields: &[&'static str]) -> Self {
+    /// Override the rendered width
+    ///
+    /// By default, the width is loaded by inspecting the TTY. If a TTY is not available,
+    /// it defaults to 120
+    pub fn width(mut self, width: usize) -> Self {
+        self.settings.width = width;
+        self
+    }
+
+    /// When printing spans & events, only render the following fields
+    pub fn only_show_fields(mut self, fields: &[&'static str]) -> Self {
         self.settings = self.settings.only_show_fields(fields);
         self
     }
 
+    /// Only render spans longer than `duration`
     pub fn min_duration(mut self, duration: Duration) -> Self {
         self.settings = self.settings.min_duration(duration);
         self
     }
 
+    /// Create a [`TexRayLayer`] from specific settings
     pub fn with_settings(settings: Settings) -> Self {
         let mut layer = Self::_new();
         layer.configure(settings);
         layer
     }
 
+    /// Update the settings of this [`TexRayLayer`]
     pub fn update_settings(mut self, f: impl Fn(Settings) -> Settings) -> Self {
         self.settings = f(self.settings);
         self
