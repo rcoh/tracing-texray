@@ -1,6 +1,6 @@
 # tracing-texray
 
-> First, a word of warning: **This is alpha software.** Don't run this in prod or anywhere where a panic would be ruin your day.
+> First, a word of warning: **This is alpha software.** Don't run this in prod or anywhere where a panic would ruin your day.
 
 `tracing-texray` is a [tracing](https://tracing.rs) layer to introspect spans and events in plain text. By `examine`-ing a specific
 span, a full tree will be output when that span exits. Using code like the following (actual program elided):
