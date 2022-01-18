@@ -11,7 +11,7 @@ use parking_lot::RwLock;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::fmt::{Debug, Formatter};
-use std::io::{stderr, Write};
+use std::io::{ stderr, Write};
 use std::ops::DerefMut;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
@@ -39,7 +39,7 @@ struct EventInfo {
 impl EventInfo {
     fn to_string(&self, settings: &Settings) -> String {
         let mut out = String::new();
-        self.metadata.write(&mut out, settings).unwrap();
+        self.metadata.write(&mut out, settings).expect("writing to a string cannot fail");
         out
     }
 }
@@ -132,11 +132,13 @@ impl TrackedMetadata {
         }
 
         write!(f, "{{")?;
-        for (k, v) in relevant_fields().take(self.data.len() - 1) {
-            write!(f, "{}: {}, ", k, v)?;
+        let mut peekable = relevant_fields().peekable();
+        while let Some((k, v)) = peekable.next() {
+            write!(f, "{}: {}", k, v)?;
+            if peekable.peek().is_some() {
+                write!(f, ", ")?;
+            }
         }
-        let (k, v) = relevant_fields().last().expect("non empty");
-        write!(f, "{}: {}", k, v)?;
         write!(f, "}}")
     }
 }
@@ -158,6 +160,10 @@ impl SpanInfo {
         id
     }
 
+    fn duration(&self) -> Option<Duration> {
+        self.end.and_then(|end|end.duration_since(self.start).ok())
+    }
+
     fn render(
         &self,
         out: &mut dyn Write,
@@ -170,11 +176,10 @@ impl SpanInfo {
         let truncated_key_width = render_conf.key_width - left_offset;
         key.truncate(truncated_key_width);
         let ev_start_ts = self.start;
-        let ev_end_ts = match self.end {
+        let span_len = match self.duration() {
             None => return Ok(()),
-            Some(ts) => ts,
+            Some(dur) => dur,
         };
-        let span_len = ev_end_ts.duration_since(ev_start_ts).unwrap();
         if let Some(min_duration) = settings.min_duration.as_ref() {
             if &span_len < min_duration {
                 return Ok(());
@@ -194,9 +199,9 @@ impl SpanInfo {
         let offset = width(
             render_conf.chart_width(),
             render_conf.total(),
-            ev_start_ts.duration_since(render_conf.start_ts).unwrap(),
+            match ev_start_ts.duration_since(render_conf.start_ts) { Ok(dur) => dur, Err(_) => return Ok(())},
         );
-        write!(out, "{}", " ".repeat(offset)).unwrap();
+        write!(out, "{}", " ".repeat(offset))?;
         let interval_width = width(render_conf.chart_width(), render_conf.total(), span_len);
         match interval_width {
             0 => write!(out, "┆"),
@@ -243,6 +248,7 @@ struct RenderConf {
 
 impl RenderConf {
     fn total(&self) -> Duration {
+        // start_ts is always less than end_ts
         self.end_ts.duration_since(self.start_ts).unwrap()
     }
 
@@ -308,21 +314,19 @@ impl SpanTracker {
 
     fn path<'a, S>(
         &self,
-        span: &span::Id,
-        ctx: &'a Context<'a, S>,
+        scope: tracing_subscriber::registry::Scope<'a, S>,
     ) -> impl Iterator<Item = span::Id> + 'a
     where
         S: Subscriber + for<'span> LookupSpan<'span> + Send + Sync,
     {
         let root = self.span_id.clone();
-        let mut path = ctx
-            .span_scope(span)
-            .unwrap()
+
+        let path = scope
             .from_root()
             .skip_while(move |span| span.id() != root)
+            // skip until the root, then skip over the root
+            .skip(1)
             .map(|s| s.id());
-        let path_root = path.next().expect("one item exists");
-        assert_eq!(&path_root, &self.span_id);
         path
     }
 
@@ -407,7 +411,7 @@ impl SpanTracker {
                 span_info
                     .start
                     .duration_since(render_conf.start_ts)
-                    .unwrap(),
+                    .expect("start_ts MUST be before span_info.start because it is a minima"),
             );
             let mut settings_with_message = settings.clone();
             if let FieldFilter::AllowList(list) = &mut settings_with_message.field_printing {
@@ -697,18 +701,18 @@ impl TeXRayLayer {
         &self,
         span: &span::Id,
         ctx: &Context<'a, S>,
-        f: impl Fn(&mut SpanTracker),
+        f: impl Fn(&mut SpanTracker, tracing_subscriber::registry::Scope<'_, S>),
     ) where
         S: Subscriber + for<'span> LookupSpan<'span> + Send + Sync,
     {
         if let Some(mut span_iter) = ctx.span_scope(span) {
             let trackers = self.tracked_spans.upgradable_read();
             if span_iter.any(|span| trackers.contains_key(&span.id())) {
-                let span_iter = ctx.span_scope(span).unwrap();
+                let span_iter = ctx.span_scope(span).expect("span scope exists, loaded above");
                 let mut trackers = RwLockUpgradableReadGuard::upgrade(trackers);
                 for span_ref in span_iter {
                     if let Some(span_tracker) = trackers.get_mut(&span_ref.id()) {
-                        f(span_tracker)
+                        f(span_tracker, ctx.span_scope(span).unwrap())
                     }
                 }
             }
@@ -757,33 +761,33 @@ where
                 timestamp: SystemTime::now(),
                 metadata,
             };
-            self.for_relevant_trackers(span, &ctx, |tracker| {
-                tracker.add_event(span, tracker.path(span, &ctx), tracked_event.clone())
+            self.for_relevant_trackers(span, &ctx, |tracker, scope| {
+                tracker.add_event(span, tracker.path(scope), tracked_event.clone())
             })
         }
     }
 
     fn on_new_span(&self, attrs: &Attributes<'_>, id: &Id, ctx: Context<'_, S>) {
-        self.for_relevant_trackers(id, &ctx, |tracker| {
-            tracker.record_metadata(id, tracker.path(id, &ctx), attrs)
+        self.for_relevant_trackers(id, &ctx, |tracker, scope| {
+            tracker.record_metadata(id, tracker.path(scope), attrs)
         })
     }
 
     fn on_record(&self, id: &Id, values: &Record<'_>, ctx: Context<'_, S>) {
-        self.for_relevant_trackers(id, &ctx, |tracker| {
-            tracker.record_metadata(id, tracker.path(id, &ctx), values);
+        self.for_relevant_trackers(id, &ctx, |tracker, scope| {
+            tracker.record_metadata(id, tracker.path(scope), values);
         })
     }
 
     fn on_enter(&self, id: &Id, ctx: Context<'_, S>) {
-        self.for_relevant_trackers(id, &ctx, |tracker| {
-            tracker.open(id, tracker.path(id, &ctx), SpanInfo::for_span(id, &ctx));
+        self.for_relevant_trackers(id, &ctx, |tracker, scope| {
+            tracker.open(id, tracker.path(scope), SpanInfo::for_span(id, &ctx));
         });
     }
 
     fn on_close(&self, id: Id, ctx: Context<'_, S>) {
-        self.for_relevant_trackers(&id, &ctx, |tracker| {
-            tracker.exit(&id, tracker.path(&id, &ctx), SystemTime::now())
+        self.for_relevant_trackers(&id, &ctx, |tracker, scope| {
+            tracker.exit(&id, tracker.path(scope), SystemTime::now())
         });
         if let Some(tracker) = self.tracked_spans.read().get(&id) {
             let _ = tracker.dump(self.settings());
@@ -793,7 +797,7 @@ where
 
 #[cfg(test)]
 mod test {
-    use crate::{width, Settings, SpanInfo, SpanTracker};
+    use crate::{width, Settings, SpanInfo, SpanTracker, TrackedMetadata};
     use std::iter;
     use std::ops::Add;
     use std::time::{Duration, UNIX_EPOCH};
@@ -837,6 +841,26 @@ mod test {
     }
 
     #[test]
+    fn render_metadata() {
+        let metadata = TrackedMetadata {
+            data: vec![("A".to_string(), "B".to_string()), ("c".to_string(), "d".to_string())]
+        };
+        let mut out = String::new();
+        metadata.write(&mut out, &Settings::default()).unwrap();
+        assert_eq!(out, "{A: B, c: d}");
+    }
+
+    #[test]
+    fn render_empty_metadata() {
+        let metadata = TrackedMetadata {
+            data: vec![]
+        };
+        let mut out = String::new();
+        metadata.write(&mut out, &Settings::default()).unwrap();
+        assert_eq!(out, "");
+    }
+
+    #[test]
     fn render_correct_output() {
         let id_0 = Id::from_u64(1);
         let id_1 = Id::from_u64(2);
@@ -847,7 +871,7 @@ mod test {
             &id_0,
             iter::empty(),
             SpanInfo {
-                name: "test".to_string(),
+                name: "test",
                 start: interval_start,
                 end: None,
             },
@@ -857,7 +881,7 @@ mod test {
                 &id_1,
                 &mut [id_1.clone()].iter().cloned(),
                 SpanInfo {
-                    name: "nested".to_string(),
+                    name: "nested",
                     start: interval_start + Duration::from_secs(2),
                     end: None,
                 },
