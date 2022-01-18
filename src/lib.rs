@@ -7,16 +7,19 @@
     unreachable_pub
 )]
 
+use parking_lot::RwLock;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::fmt::{Debug, Formatter};
 use std::io::{stderr, Write};
 use std::ops::DerefMut;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
+use parking_lot::lock_api::RwLockUpgradableReadGuard;
 use tracing::field::{Field, Visit};
 use tracing::span::{Attributes, Record};
 
+use tracing::subscriber::set_global_default;
 use tracing::{span, Event as TracingEvent, Id, Span, Subscriber};
 use tracing_subscriber::field::RecordFields;
 
@@ -47,7 +50,10 @@ impl SpanInfo {
         S: Subscriber + for<'span> LookupSpan<'span> + Send + Sync,
     {
         Self {
-            name: ctx.metadata(span).unwrap().name().to_string(),
+            name: ctx
+                .metadata(span)
+                .map(|metadata| metadata.name())
+                .unwrap_or("could-not-find-span"),
             start: SystemTime::now(),
             end: None,
         }
@@ -139,7 +145,7 @@ impl TrackedMetadata {
 struct SpanInfo {
     start: SystemTime,
     end: Option<SystemTime>,
-    name: String,
+    name: &'static str,
 }
 
 impl SpanInfo {
@@ -629,6 +635,13 @@ impl TeXRayLayer {
         dumper
     }
 
+    /// Install [`TexRayLayer`] as the global default
+    pub fn init(self) {
+        let registry = tracing_subscriber::registry().with(self);
+        use tracing_subscriber::layer::SubscriberExt;
+        set_global_default(registry).expect("failed to install subscriber")
+    }
+
     fn settings(&self) -> &Settings {
         &self.settings
     }
@@ -688,11 +701,15 @@ impl TeXRayLayer {
     ) where
         S: Subscriber + for<'span> LookupSpan<'span> + Send + Sync,
     {
-        if let Some(span_iter) = ctx.span_scope(span) {
-            let mut tracker = self.tracked_spans.write().unwrap();
-            for span_ref in span_iter {
-                if let Some(inner) = tracker.get_mut(&span_ref.id()) {
-                    f(inner)
+        if let Some(mut span_iter) = ctx.span_scope(span) {
+            let trackers = self.tracked_spans.upgradable_read();
+            if span_iter.any(|span| trackers.contains_key(&span.id())) {
+                let span_iter = ctx.span_scope(span).unwrap();
+                let mut trackers = RwLockUpgradableReadGuard::upgrade(trackers);
+                for span_ref in span_iter {
+                    if let Some(span_tracker) = trackers.get_mut(&span_ref.id()) {
+                        f(span_tracker)
+                    }
                 }
             }
         }
@@ -702,7 +719,6 @@ impl TeXRayLayer {
         if let Some(id) = span.id() {
             self.tracked_spans
                 .write()
-                .unwrap()
                 .insert(id.clone(), SpanTracker::new(id, settings));
         }
     }
@@ -769,7 +785,7 @@ where
         self.for_relevant_trackers(&id, &ctx, |tracker| {
             tracker.exit(&id, tracker.path(&id, &ctx), SystemTime::now())
         });
-        if let Some(tracker) = self.tracked_spans.read().unwrap().get(&id) {
+        if let Some(tracker) = self.tracked_spans.read().get(&id) {
             let _ = tracker.dump(self.settings());
         }
     }
