@@ -6,6 +6,7 @@ edition = "2018"
 authors = ["russell.r.cohen@gmail.com"]
 license = "MIT"
 repository = "https://github.com/rcoh/tracing-texray"
+rust-version = "1.54.0"
 
 [dependencies]
 tracing-subscriber = "0.3.5"

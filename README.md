@@ -2,8 +2,25 @@
 
 > First, a word of warning: **This is alpha software.** Don't run this in prod or anywhere where a panic would be ruin your day.
 
-`tracing-texray` is a tracing layer to introspect tracing spans and events in plain text. By `examine`-ing a specific
-span, a full tree will be dumped when that span exits. Example output:
+`tracing-texray` is a [tracing](https://tracing.rs) layer to introspect spans and events in plain text. By `examine`-ing a specific
+span, a full tree will be output when that span exits. Using code like the following (actual program elided):
+
+```rust
+fn main() {
+    // initialize & install as the global subscriber
+    tracing_texray::init();
+    // examine the `load_data` span:
+    tracing_texray::examine(tracing::info_span!("load_data")).in_scope(|| {
+        do_a_thing()
+    });
+}
+
+fn do_a_thing() {
+    // ...
+}
+```
+
+You would see the following output printed to stderr:
 
 ```text
 load_data                                52ms ├────────────────────────────────┤
@@ -21,7 +38,7 @@ In cases where a more powerful solution like [tracing-chrome](https://crates.io/
 
 `tracing-texray` combines two pieces: a global subscriber, and local span examination. By default, `tracing-texray` won't
 print anything—it just sits in the background. But: once a span is `examine`'d, `tracing-texray` will track the
-span and all of it's children. When the span exits, span diagnostics will be printed to stderr (or another `impl io::Write`
+span and all of its children. When the span exits, span diagnostics will be printed to stderr (or another `impl io::Write`
 as configured).
 
 **First**, the layer must be installed globally:
