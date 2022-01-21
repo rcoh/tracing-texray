@@ -1,4 +1,4 @@
-# tracing-texray
+# tracing-texray ![Crates.io](https://img.shields.io/crates/v/tracing-texray)
 
 > First, a word of warning: **This is alpha software.** Don't run this in prod or anywhere where a panic would ruin your day.
 
