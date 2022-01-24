@@ -3,8 +3,8 @@ use tracing::info_span;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_texray::TeXRayLayer;
 
-#[test]
-fn test_me() {
+#[tokio::test]
+async fn test_me() {
     let layer = TeXRayLayer::new().width(80).enable_events();
     let registry = tracing_subscriber::registry().with(layer);
     tracing::subscriber::set_global_default(registry).expect("failed to install subscriber");
@@ -24,7 +24,11 @@ fn test_me() {
         })
     });
 
-    somewhere_deep_in_my_program();
+    for _ in 0..5 {
+        tokio::spawn(async {
+            somewhere_deep_in_my_program();
+        }).await.unwrap();
+    }
 }
 
 fn somewhere_deep_in_my_program() {

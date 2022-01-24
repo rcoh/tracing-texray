@@ -9,13 +9,15 @@
 
 use parking_lot::RwLock;
 use std::borrow::Cow;
+
 use std::collections::{HashMap, HashSet};
 use std::fmt::{Debug, Formatter};
 use std::io::{ stderr, Write};
 use std::ops::DerefMut;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, atomic, Mutex};
+use std::sync::atomic::AtomicBool;
 use std::time::{Duration, SystemTime};
-use parking_lot::lock_api::RwLockUpgradableReadGuard;
+
 use tracing::field::{Field, Visit};
 use tracing::span::{Attributes, Record};
 
@@ -293,9 +295,11 @@ impl SpanTracker {
     }
 
     fn open(&mut self, span: &span::Id, path: impl Iterator<Item = span::Id>, span_info: SpanInfo) {
-        self._with_tracker(span, path, |tracker| match &mut tracker.info {
-            Some(_info) => tracing::error!("opening a span twice"),
-            None => tracker.info = Some(span_info),
+        self._with_tracker(span, path, |tracker| {
+            match &mut tracker.info {
+                Some(_info) => {} // span already open, don't update
+                None => tracker.info = Some(span_info),
+            }
         });
     }
 
@@ -308,7 +312,7 @@ impl SpanTracker {
     ) {
         self._with_tracker(span, path, |tracker| match &mut tracker.info {
             Some(info) => info.end = Some(timestamp),
-            None => tracing::error!("Attempting to exit a span that has never been entered"),
+            None => {} // this is a bug, exiting a span that has never been entered
         })
     }
 
@@ -612,6 +616,7 @@ impl Settings {
 pub struct TeXRayLayer {
     tracked_spans: Arc<RwLock<HashMap<span::Id, SpanTracker>>>,
     settings: Settings,
+    initialized: Arc<AtomicBool>
 }
 
 /// Initialize a default subscriber and install it as the global default
@@ -627,12 +632,14 @@ impl TeXRayLayer {
         Self {
             tracked_spans: Default::default(),
             settings: Default::default(),
+            initialized: Arc::new(AtomicBool::new(false))
         }
     }
 
     /// Create a new [`TeXRayLayer`] with settings from [`Settings::auto`]
     pub fn new() -> Self {
         let mut dumper = DUMPER.clone();
+        dumper.initialized.store(true, std::sync::atomic::Ordering::SeqCst);
         if !dumper.settings.updated {
             dumper.settings = Settings::auto();
         }
@@ -705,11 +712,13 @@ impl TeXRayLayer {
     ) where
         S: Subscriber + for<'span> LookupSpan<'span> + Send + Sync,
     {
+
         if let Some(mut span_iter) = ctx.span_scope(span) {
-            let trackers = self.tracked_spans.upgradable_read();
+            let trackers = self.tracked_spans.read();
             if span_iter.any(|span| trackers.contains_key(&span.id())) {
+                drop(trackers);
+                let mut trackers = self.tracked_spans.write();
                 let span_iter = ctx.span_scope(span).expect("span scope exists, loaded above");
-                let mut trackers = RwLockUpgradableReadGuard::upgrade(trackers);
                 for span_ref in span_iter {
                     if let Some(span_tracker) = trackers.get_mut(&span_ref.id()) {
                         f(span_tracker, ctx.span_scope(span).unwrap())
@@ -720,6 +729,9 @@ impl TeXRayLayer {
     }
 
     fn dump_on_exit(&self, span: &Span, settings: Option<Settings>) {
+        if !self.initialized.load(atomic::Ordering::Relaxed) {
+            return
+        }
         if let Some(id) = span.id() {
             self.tracked_spans
                 .write()
@@ -753,7 +765,28 @@ impl<S> Layer<S> for TeXRayLayer
 where
     S: Subscriber + for<'span> LookupSpan<'span> + Send + Sync,
 {
+    fn on_new_span(&self, attrs: &Attributes<'_>, id: &Id, ctx: Context<'_, S>) {
+        if !self.initialized.load(atomic::Ordering::Relaxed) {
+            return
+        }
+        self.for_relevant_trackers(id, &ctx, |tracker, scope| {
+            tracker.record_metadata(id, tracker.path(scope), attrs)
+        })
+    }
+
+    fn on_record(&self, id: &Id, values: &Record<'_>, ctx: Context<'_, S>) {
+        if !self.initialized.load(atomic::Ordering::Relaxed) {
+            return
+        }
+        self.for_relevant_trackers(id, &ctx, |tracker, scope| {
+            tracker.record_metadata(id, tracker.path(scope), values);
+        });
+    }
+
     fn on_event(&self, event: &TracingEvent<'_>, ctx: Context<'_, S>) {
+        if !self.initialized.load(atomic::Ordering::Relaxed) {
+            return
+        }
         if let Some(span) = ctx.current_span().id() {
             let mut metadata = TrackedMetadata::default();
             event.record(&mut metadata);
@@ -767,25 +800,19 @@ where
         }
     }
 
-    fn on_new_span(&self, attrs: &Attributes<'_>, id: &Id, ctx: Context<'_, S>) {
-        self.for_relevant_trackers(id, &ctx, |tracker, scope| {
-            tracker.record_metadata(id, tracker.path(scope), attrs)
-        })
-    }
-
-    fn on_record(&self, id: &Id, values: &Record<'_>, ctx: Context<'_, S>) {
-        self.for_relevant_trackers(id, &ctx, |tracker, scope| {
-            tracker.record_metadata(id, tracker.path(scope), values);
-        })
-    }
-
     fn on_enter(&self, id: &Id, ctx: Context<'_, S>) {
+        if !self.initialized.load(atomic::Ordering::Relaxed) {
+            return
+        }
         self.for_relevant_trackers(id, &ctx, |tracker, scope| {
             tracker.open(id, tracker.path(scope), SpanInfo::for_span(id, &ctx));
         });
     }
 
     fn on_close(&self, id: Id, ctx: Context<'_, S>) {
+        if !self.initialized.load(atomic::Ordering::Relaxed) {
+            return
+        }
         self.for_relevant_trackers(&id, &ctx, |tracker, scope| {
             tracker.exit(&id, tracker.path(scope), SystemTime::now())
         });
