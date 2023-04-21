@@ -1,4 +1,4 @@
-#![doc = include_str!("../README.md")]
+#![doc = include_str ! ("../README.md")]
 #![warn(
     missing_docs,
     rustdoc::missing_crate_level_docs,
@@ -7,24 +7,29 @@
     unreachable_pub
 )]
 
-use parking_lot::RwLock;
+mod hashset;
+
+use parking_lot::{Mutex, RwLock};
 use std::borrow::Cow;
 
+use parking_lot::lock_api::{MutexGuard, RawMutex};
 use std::collections::{HashMap, HashSet};
 use std::fmt::{Debug, Formatter};
-use std::io::{ stderr, Write};
-use std::ops::DerefMut;
-use std::sync::{Arc, atomic, Mutex};
-use std::sync::atomic::AtomicBool;
+use std::io;
+use std::io::{stderr, Write};
+use std::ops::{Deref, DerefMut};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use tracing::field::{Field, Visit};
 use tracing::span::{Attributes, Record};
 
 use tracing::subscriber::set_global_default;
-use tracing::{span, Event as TracingEvent, Id, Span, Subscriber};
+use tracing::{Event as TracingEvent, Id, Span, Subscriber};
 use tracing_subscriber::field::RecordFields;
 
+use crate::hashset::TrackedSpans;
 use tracing_subscriber::layer::Context;
 use tracing_subscriber::registry::LookupSpan;
 use tracing_subscriber::{Layer, Registry};
@@ -39,15 +44,17 @@ struct EventInfo {
 }
 
 impl EventInfo {
-    fn to_string(&self, settings: &Settings) -> String {
+    fn to_string(&self, settings: &FieldSettings) -> String {
         let mut out = String::new();
-        self.metadata.write(&mut out, settings).expect("writing to a string cannot fail");
+        self.metadata
+            .write(&mut out, settings)
+            .expect("writing to a string cannot fail");
         out
     }
 }
 
 impl SpanInfo {
-    fn for_span<S>(span: &span::Id, ctx: &Context<'_, S>) -> Self
+    fn for_span<S>(span: &Id, ctx: &Context<'_, S>) -> Self
     where
         S: Subscriber + for<'span> LookupSpan<'span> + Send + Sync,
     {
@@ -63,7 +70,15 @@ impl SpanInfo {
 }
 
 lazy_static::lazy_static! {
-    static ref DUMPER: TeXRayLayer = TeXRayLayer::_new();
+    static ref GLOBAL_TEXRAY_LAYER: TeXRayLayer = TeXRayLayer::uninitialized();
+}
+
+macro_rules! check_initialized {
+    ($self: expr) => {
+        if !$self.initialized() {
+            return;
+        }
+    };
 }
 
 /// Examine a given span with custom settings
@@ -84,7 +99,7 @@ lazy_static::lazy_static! {
 /// });
 /// ```
 pub fn examine_with(span: Span, local_settings: Settings) -> Span {
-    DUMPER.dump_on_exit(&span, Some(local_settings));
+    GLOBAL_TEXRAY_LAYER.dump_on_exit(&span, Some(local_settings.locked()));
     span
 }
 
@@ -106,28 +121,28 @@ pub fn examine_with(span: Span, local_settings: Settings) -> Span {
 /// });
 /// ```
 pub fn examine(span: Span) -> Span {
-    DUMPER.dump_on_exit(&span, None);
+    GLOBAL_TEXRAY_LAYER.dump_on_exit(&span, None);
     span
 }
 
 #[derive(Default, Debug, Clone)]
 struct TrackedMetadata {
-    data: Vec<(String, String)>,
+    data: Vec<(&'static str, String)>,
 }
 
 impl TrackedMetadata {
-    fn write(&self, f: &mut impl std::fmt::Write, settings: &Settings) -> std::fmt::Result {
+    fn write(&self, f: &mut impl std::fmt::Write, settings: &FieldSettings) -> std::fmt::Result {
         let relevant_fields = || {
             self.data
                 .iter()
-                .filter(|(f, _)| settings.field_printing.should_print(f.as_str()))
+                .filter(|(f, _)| settings.field_printing.should_print(f))
         };
 
-        if let Some((_, message)) = relevant_fields().find(|(k, _)| k == "message") {
+        if let Some((_, message)) = relevant_fields().find(|(k, _)| *k == "message") {
             write!(f, "{}", message.lines().next().unwrap_or_default())?;
         }
 
-        let relevant_fields = || relevant_fields().filter(|(k, _v)| k != "message");
+        let relevant_fields = || relevant_fields().filter(|(k, _v)| *k != "message");
 
         if relevant_fields().count() == 0 {
             return Ok(());
@@ -153,7 +168,7 @@ struct SpanInfo {
 }
 
 impl SpanInfo {
-    fn full_name(&self, tracker: &SpanTracker, settings: &Settings) -> String {
+    fn full_name(&self, tracker: &SpanTracker, settings: &FieldSettings) -> String {
         let mut id = self.name.to_string();
         tracker
             .metadata
@@ -163,18 +178,18 @@ impl SpanInfo {
     }
 
     fn duration(&self) -> Option<Duration> {
-        self.end.and_then(|end|end.duration_since(self.start).ok())
+        self.end.and_then(|end| end.duration_since(self.start).ok())
     }
 
     fn render(
         &self,
         out: &mut dyn Write,
         tracker: &SpanTracker,
-        settings: &Settings,
+        settings: &RenderSettings,
         render_conf: &RenderConf,
         left_offset: usize,
-    ) -> std::io::Result<()> {
-        let mut key = self.full_name(tracker, settings);
+    ) -> io::Result<()> {
+        let mut key = self.full_name(tracker, &tracker.settings);
         let truncated_key_width = render_conf.key_width - left_offset;
         key.truncate(truncated_key_width);
         let ev_start_ts = self.start;
@@ -193,7 +208,7 @@ impl SpanInfo {
         write!(out, "{:width$}", key, width = truncated_key_width)?;
         write!(
             out,
-            " {:>dur_width$} ",
+            " {:>dur_width$}",
             pretty_duration(span_len),
             dur_width = DURATION_WIDTH
         )?;
@@ -201,7 +216,10 @@ impl SpanInfo {
         let offset = width(
             render_conf.chart_width(),
             render_conf.total(),
-            match ev_start_ts.duration_since(render_conf.start_ts) { Ok(dur) => dur, Err(_) => return Ok(())},
+            match ev_start_ts.duration_since(render_conf.start_ts) {
+                Ok(dur) => dur,
+                Err(_) => return Ok(()),
+            },
         );
         write!(out, "{}", " ".repeat(offset))?;
         let interval_width = width(render_conf.chart_width(), render_conf.total(), span_len);
@@ -216,19 +234,27 @@ impl SpanInfo {
     }
 }
 
+/// Tracker of an individual span
 #[derive(Debug)]
 struct SpanTracker {
-    span_id: span::Id,
     info: Option<SpanInfo>,
     metadata: TrackedMetadata,
     events: Vec<EventInfo>,
-    children: HashMap<span::Id, SpanTracker>,
-    settings: Option<Settings>,
+    settings: Arc<FieldSettings>,
 }
 
-impl Visit for TrackedMetadata {
+struct FieldFilterTracked<'a> {
+    field_filter: &'a FieldFilter,
+    tracked_metadata: &'a mut TrackedMetadata,
+}
+
+impl Visit for FieldFilterTracked<'_> {
     fn record_debug(&mut self, field: &Field, value: &dyn Debug) {
-        self.data.push((field.to_string(), format!("{:?}", value)));
+        if self.field_filter.should_print(field.name()) {
+            self.tracked_metadata
+                .data
+                .push((field.name(), format!("{:?}", value)));
+        }
     }
 }
 
@@ -251,7 +277,9 @@ struct RenderConf {
 impl RenderConf {
     fn total(&self) -> Duration {
         // start_ts is always less than end_ts
-        self.end_ts.duration_since(self.start_ts).unwrap()
+        self.end_ts
+            .duration_since(self.start_ts)
+            .unwrap_or_default()
     }
 
     fn chart_width(&self) -> usize {
@@ -263,220 +291,55 @@ impl RenderConf {
 }
 
 impl SpanTracker {
-    fn new(id: span::Id, settings: Option<Settings>) -> Self {
+    fn new(settings: Arc<FieldSettings>) -> Self {
         Self {
-            span_id: id,
             info: None,
             events: vec![],
             metadata: Default::default(),
-            children: Default::default(),
             settings,
         }
     }
 
-    fn record_metadata(
-        &mut self,
-        span: &span::Id,
-        path: impl Iterator<Item = span::Id>,
-        values: &dyn RecordFields,
-    ) {
-        self._with_tracker(span, path, |tracker| {
-            values.record(&mut tracker.metadata);
-        })
-    }
-
-    fn add_event(
-        &mut self,
-        span: &span::Id,
-        path: impl Iterator<Item = span::Id>,
-        event: EventInfo,
-    ) {
-        self._with_tracker(span, path, |tracker| tracker.events.push(event));
-    }
-
-    fn open(&mut self, span: &span::Id, path: impl Iterator<Item = span::Id>, span_info: SpanInfo) {
-        self._with_tracker(span, path, |tracker| {
-            match &mut tracker.info {
-                Some(_info) => {} // span already open, don't update
-                None => tracker.info = Some(span_info),
-            }
+    fn record_metadata(&mut self, values: &dyn RecordFields) {
+        values.record(&mut FieldFilterTracked {
+            field_filter: &self.settings.field_printing,
+            tracked_metadata: &mut self.metadata,
         });
     }
 
-    // TODO: don't need meta here, just id
-    fn exit(
-        &mut self,
-        span: &span::Id,
-        path: impl Iterator<Item = span::Id>,
-        timestamp: SystemTime,
-    ) {
-        self._with_tracker(span, path, |tracker| match &mut tracker.info {
+    fn add_event(&mut self, event: EventInfo) {
+        self.events.push(event)
+    }
+
+    fn open(&mut self, span_info: SpanInfo) {
+        match self.info {
+            None => self.info = Some(span_info),
+            Some(_) => {} // already open, don't update
+        }
+    }
+
+    fn exit(&mut self, timestamp: SystemTime) {
+        match &mut self.info {
             Some(info) => info.end = Some(timestamp),
-            None => {} // this is a bug, exiting a span that has never been entered
-        })
+            None => eprintln!("this is a bug"), //
+        }
     }
 
-    fn path<'a, S>(
-        &self,
-        scope: tracing_subscriber::registry::Scope<'a, S>,
-    ) -> impl Iterator<Item = span::Id> + 'a
-    where
-        S: Subscriber + for<'span> LookupSpan<'span> + Send + Sync,
-    {
-        let root = self.span_id.clone();
-
-        let path = scope
-            .from_root()
-            .skip_while(move |span| span.id() != root)
-            // skip until the root, then skip over the root
-            .skip(1)
-            .map(|s| s.id());
-        path
+    fn span_info(&self) -> impl Iterator<Item = &SpanInfo> {
+        self.info.iter()
     }
 
-    fn events(&self) -> impl Iterator<Item = &SpanInfo> {
-        self.info.iter().chain(
-            self.children.iter().flat_map(|(_, child)| {
-                Box::new(child.events()) as Box<dyn Iterator<Item = &SpanInfo>>
-            }),
-        )
-    }
-
-    fn max_key_width(&self, settings: &Settings) -> usize {
+    fn max_key_width(&self, depth: usize) -> usize {
         let longest_self = self
             .info
             .as_ref()
-            .map(|info| info.full_name(self, settings).len())
+            .map(|info| info.full_name(self, &self.settings).len())
             .unwrap_or_default();
-        let longest_child = self
-            .children
-            .iter()
-            .map(|(_, child)| child.max_key_width(settings) + NESTED_EVENT_OFFSET)
-            .max()
-            .unwrap_or(0);
-        longest_self.max(longest_child)
-    }
-
-    fn dump(&self, settings: &Settings) -> std::io::Result<()> {
-        let settings = self.settings.as_ref().unwrap_or(settings);
-        let mut out = settings.out.inner.lock().unwrap();
-        self.dump_to(out.deref_mut(), settings)
-    }
-
-    fn dump_to(&self, w: &mut dyn Write, settings: &Settings) -> std::io::Result<()> {
-        let all_events = self.events().collect::<Vec<_>>();
-        if all_events.is_empty() {
-            return Ok(());
-        }
-        let (start_ts, end_ts) = (
-            all_events
-                .iter()
-                .map(|ev| ev.start)
-                .min()
-                .expect("non empty"),
-            all_events
-                .iter()
-                .flat_map(|ev| ev.end)
-                .max()
-                .expect("non empty"),
-        );
-        let conf = RenderConf {
-            start_ts,
-            end_ts,
-            key_width: self.max_key_width(settings).min(120),
-            width: settings.width,
-        };
-        self._dump(w, &conf, settings, 0)
-    }
-
-    fn _dump(
-        &self,
-        out: &mut dyn Write,
-        render_conf: &RenderConf,
-        settings: &Settings,
-        left_offset: usize,
-    ) -> std::io::Result<()> {
-        let span_info = match &self.info {
-            Some(info) => info,
-            /* span never got data */
-            None => return Ok(()),
-        };
-
-        if settings.types.spans {
-            span_info.render(out, self, settings, render_conf, left_offset)?;
-        }
-
-        if settings.types.events {
-            let left_offset = left_offset + 2;
-            let truncated_key_width = render_conf.key_width - left_offset;
-            let base_offset = width(
-                render_conf.chart_width(),
-                render_conf.total(),
-                span_info
-                    .start
-                    .duration_since(render_conf.start_ts)
-                    .expect("start_ts MUST be before span_info.start because it is a minima"),
-            );
-            let mut settings_with_message = settings.clone();
-            if let FieldFilter::AllowList(list) = &mut settings_with_message.field_printing {
-                list.insert("message".into());
-            }
-            for ev in &self.events {
-                let mut key = ev.to_string(&settings_with_message);
-                key.truncate(truncated_key_width);
-                if left_offset >= 1 {
-                    write!(out, "{}", " ".repeat(left_offset - 1))?;
-                }
-                write!(out, ">{:width$}", key, width = truncated_key_width)?;
-                let event_offset = (width(
-                    render_conf.chart_width(),
-                    render_conf.total(),
-                    ev.timestamp.duration_since(span_info.start).unwrap(),
-                ) as i32)
-                    - 1;
-                write!(out, "{}", " ".repeat(DURATION_WIDTH + 2))?;
-                writeln!(
-                    out,
-                    "{}┼",
-                    " ".repeat(base_offset + event_offset.max(0) as usize)
-                )?;
-            }
-        }
-        let map = &self.children;
-        let mut children = map.values().collect::<Vec<_>>();
-        children.sort_by_key(|child| child.info.as_ref().map(|it| it.start));
-
-        for child in children {
-            child._dump(
-                out,
-                render_conf,
-                settings,
-                left_offset + NESTED_EVENT_OFFSET,
-            )?;
-        }
-        Ok(())
-    }
-
-    fn _with_tracker(
-        &mut self,
-        span: &span::Id,
-        mut path: impl Iterator<Item = span::Id>,
-        f: impl FnOnce(&mut SpanTracker),
-    ) {
-        match path.next() {
-            None => f(self),
-            Some(id) => {
-                let child = self
-                    .children
-                    .entry(id.clone())
-                    .or_insert_with(|| SpanTracker::new(id, None));
-                child._with_tracker(span, path, f);
-            }
-        }
+        longest_self + NESTED_EVENT_OFFSET * (depth - 1)
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 struct Types {
     events: bool,
     spans: bool,
@@ -489,14 +352,29 @@ pub struct Settings {
     min_duration: Option<Duration>,
     types: Types,
     field_printing: FieldFilter,
-    updated: bool,
-    out: DynWriter,
+    default_output: DynWriter,
+}
+
+impl Settings {
+    fn locked(self) -> SpanSettings {
+        SpanSettings {
+            render: RenderSettings {
+                width: self.width,
+                min_duration: self.min_duration,
+                types: self.types,
+            },
+            fields: FieldSettings {
+                field_printing: self.field_printing,
+            },
+            out: self.default_output,
+        }
+    }
 }
 
 /// Wrap a dyn writer to get a Debug implementation
 #[derive(Clone)]
 struct DynWriter {
-    inner: Arc<Mutex<dyn std::io::Write + Send>>,
+    inner: Arc<Mutex<dyn Write + Send>>,
 }
 
 impl Debug for DynWriter {
@@ -520,6 +398,9 @@ impl Default for FieldFilter {
 
 impl FieldFilter {
     fn should_print(&self, field: &str) -> bool {
+        if field == "message" {
+            return true;
+        }
         match &self {
             FieldFilter::DenyList(deny) => !deny.contains(field),
             FieldFilter::AllowList(allow) => allow.contains(field),
@@ -537,8 +418,7 @@ impl Default for Settings {
                 spans: true,
             },
             field_printing: Default::default(),
-            updated: false,
-            out: DynWriter {
+            default_output: DynWriter {
                 inner: Arc::new(Mutex::new(stderr())),
             },
         }
@@ -564,29 +444,30 @@ impl Settings {
     #[must_use]
     pub fn width(mut self, width: usize) -> Self {
         self.width = width;
-        self.updated = true;
         self
     }
 
     /// Overwrite the writer [`TexRayLayer`] will output to
-    pub fn writer<W: Write + Send + 'static>(mut self, w: W) -> Self {
-        self.out = DynWriter {
+    pub fn writer<W: Write + Send + 'static>(&mut self, w: W) -> &mut Self {
+        self.default_output = DynWriter {
             inner: Arc::new(Mutex::new(w)),
         };
         self
     }
 
     /// Print events in addition to spans
-    #[must_use]
     pub fn enable_events(mut self) -> Self {
-        self.types.events = true;
-        self.updated = true;
+        self.set_enable_events(true);
+        self
+    }
+
+    fn set_enable_events(&mut self, enabled: bool) -> &mut Self {
+        self.types.events = enabled;
         self
     }
 
     /// When printing spans & events, only render the following fields
-    #[must_use]
-    pub fn only_show_fields(mut self, fields: &[&'static str]) -> Self {
+    pub fn only_show_fields(&mut self, fields: &[&'static str]) -> &mut Self {
         self.field_printing =
             FieldFilter::AllowList(fields.iter().map(|item| Cow::Borrowed(*item)).collect());
         self
@@ -601,8 +482,7 @@ impl Settings {
     }
 
     /// Only show spans longer than a minimum duration
-    #[must_use]
-    pub fn min_duration(mut self, duration: Duration) -> Self {
+    pub fn min_duration(&mut self, duration: Duration) -> &mut Self {
         self.min_duration = Some(duration);
         self
     }
@@ -612,11 +492,305 @@ impl Settings {
 ///
 /// _Note:_ This layer does nothing on its own. It must be used in combination with [`examine`] to
 /// print the summary of a specific span.
-#[derive(Clone, Debug)]
+#[derive(Debug, Clone)]
 pub struct TeXRayLayer {
-    tracked_spans: Arc<RwLock<HashMap<span::Id, SpanTracker>>>,
-    settings: Settings,
-    initialized: Arc<AtomicBool>
+    settings: Arc<Mutex<SettingsContainer>>,
+    initialized: Arc<AtomicBool>,
+    tracker: Arc<RootTracker>,
+}
+
+#[derive(Debug)]
+struct RootTracker {
+    root_span_ids: TrackedSpans,
+    span_metadata: RwLock<HashMap<Id, InterestTracker>>,
+}
+
+#[derive(Debug)]
+struct InterestTracker {
+    field_settings: Arc<FieldSettings>,
+    render_settings: RenderSettings,
+    out: DynWriter,
+    children: HashMap<Vec<Id>, SpanTracker>,
+}
+
+impl InterestTracker {
+    fn new(
+        id: Id,
+        settings: RenderSettings,
+        field_settings: FieldSettings,
+        out: DynWriter,
+    ) -> Self {
+        let mut children = HashMap::new();
+        children.insert(vec![id], SpanTracker::new(Arc::new(field_settings.clone())));
+        Self {
+            children,
+            field_settings: Arc::new(field_settings),
+            render_settings: settings,
+            out,
+        }
+    }
+
+    fn new_span(&mut self, path: Vec<Id>) -> &mut SpanTracker {
+        let settings = self.field_settings.clone();
+        self.children
+            .entry(path)
+            .or_insert_with(|| SpanTracker::new(settings))
+    }
+
+    fn record_metadata(&mut self, path: &[Id], fields: &dyn RecordFields) {
+        self.children
+            .get_mut(path)
+            .map(|s| s.record_metadata(fields));
+    }
+
+    #[track_caller]
+    fn span(&mut self, path: &[Id]) -> &mut SpanTracker {
+        let settings = self.field_settings.clone();
+        self.children
+            .entry(path.to_vec())
+            .or_insert_with(|| SpanTracker::new(settings))
+    }
+
+    fn open(&mut self, path: Vec<Id>, span_info: SpanInfo) {
+        self.span(&path).open(span_info);
+    }
+
+    fn add_event(&mut self, path: &[Id], event: EventInfo) {
+        self.span(path).add_event(event);
+    }
+
+    fn exit(&mut self, path: &[Id], timestamp: SystemTime) {
+        self.span(path).exit(timestamp);
+    }
+
+    fn spans(&self) -> impl Iterator<Item = &SpanInfo> {
+        self.children.values().flat_map(|c| c.span_info())
+    }
+
+    fn dump(&self) -> io::Result<()> {
+        let mut out = self.out.inner.lock();
+        let settings = &self.render_settings;
+        let all_events = self.spans().collect::<Vec<_>>();
+        if all_events.is_empty() {
+            write!(&mut out, "no events...")?;
+            return Ok(());
+        }
+        let (start_ts, end_ts) = (
+            all_events
+                .iter()
+                .map(|ev| ev.start)
+                .min()
+                .expect("non empty"),
+            all_events
+                .iter()
+                .flat_map(|ev| ev.end)
+                .max()
+                .expect("non empty"),
+        );
+        let conf = RenderConf {
+            start_ts,
+            end_ts,
+            key_width: self
+                .children
+                .iter()
+                .map(|(path, t)| t.max_key_width(path.len()))
+                .max()
+                .unwrap_or(120)
+                .min(120),
+            width: settings.width,
+        };
+        let mut ordered = self.children.iter().collect::<Vec<_>>();
+        ordered
+            .sort_by_key(|(key, _)| sort_key(&self.children, key.as_slice()).collect::<Vec<_>>());
+
+        for (key, track) in ordered.iter() {
+            let offset = NESTED_EVENT_OFFSET * (key.len() - 1);
+            if let Some(info) = track.info.as_ref() {
+                if settings.types.spans {
+                    info.render(out.deref_mut(), track, settings, &conf, offset)?;
+                }
+                if settings.types.events {
+                    self.render_events(
+                        out.deref_mut(),
+                        &track.events,
+                        offset,
+                        &conf,
+                        info,
+                        &self.field_settings,
+                    )?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn render_events(
+        &self,
+        mut out: impl Write,
+        events: &[EventInfo],
+        left_offset: usize,
+        render_conf: &RenderConf,
+        span_info: &SpanInfo,
+        field_settings: &FieldSettings,
+    ) -> io::Result<()> {
+        let left_offset = left_offset + 2;
+        let truncated_key_width = render_conf.key_width - left_offset;
+        let base_offset = width(
+            render_conf.chart_width(),
+            render_conf.total(),
+            span_info
+                .start
+                .duration_since(render_conf.start_ts)
+                .expect("start_ts MUST be before span_info.start because it is a minima"),
+        );
+        let mut settings_with_message = field_settings.clone();
+        if let FieldFilter::AllowList(list) = &mut settings_with_message.field_printing {
+            list.insert("message".into());
+        }
+        for ev in events {
+            let mut key = ev.to_string(&settings_with_message);
+            key.truncate(truncated_key_width);
+            if left_offset >= 1 {
+                write!(out, "{}", " ".repeat(left_offset - 1))?;
+            }
+            write!(out, ">{:width$}", key, width = truncated_key_width)?;
+            let event_offset = (width(
+                render_conf.chart_width(),
+                render_conf.total(),
+                ev.timestamp.duration_since(span_info.start).unwrap(),
+            ) as i32)
+                - 1;
+            write!(out, "{}", " ".repeat(DURATION_WIDTH + 2))?;
+            writeln!(
+                out,
+                "{}┼",
+                " ".repeat(base_offset + event_offset.max(0) as usize)
+            )?;
+        }
+        Ok(())
+    }
+}
+
+impl RootTracker {
+    fn new() -> Self {
+        Self {
+            root_span_ids: TrackedSpans::new(1024),
+            span_metadata: Default::default(),
+        }
+    }
+
+    fn register_interest(&self, id: Id, settings: SpanSettings) {
+        self.root_span_ids.insert(id.into_non_zero_u64());
+        self.span_metadata.write().insert(
+            id.clone(),
+            InterestTracker::new(id, settings.render, settings.fields, settings.out),
+        );
+    }
+
+    fn if_interested<T>(
+        &self,
+        ids: impl Iterator<Item = Id>,
+        f: impl Fn(&mut InterestTracker, Vec<Id>) -> T,
+    ) -> Option<T> {
+        let mut iter = ids
+            .skip_while(|id| !self.root_span_ids.contains(id.into_non_zero_u64()))
+            .peekable();
+        if let Some(root) = iter.peek() {
+            let root = root.clone();
+            let iter = iter.collect();
+            let mut tracker = self.span_metadata.write();
+            Some(f(tracker.get_mut(&root).expect("must exist"), iter))
+        } else {
+            None
+        }
+    }
+}
+
+fn sort_key(
+    map: &HashMap<Vec<Id>, SpanTracker>,
+    target: &[Id],
+) -> impl Iterator<Item = SystemTime> {
+    if target.is_empty() {
+        Box::new(std::iter::empty()) as Box<dyn Iterator<Item = SystemTime>>
+    } else {
+        let span = map.get(target).expect("missing");
+        Box::new(
+            std::iter::once(span.info.as_ref().unwrap().start)
+                .chain(sort_key(map, &target[..target.len() - 1])),
+        )
+    }
+}
+
+#[derive(Debug)]
+enum SettingsContainer {
+    Unlocked(Settings),
+    Locked(SpanSettings),
+}
+
+#[derive(Debug, Clone)]
+struct SpanSettings {
+    render: RenderSettings,
+    fields: FieldSettings,
+    out: DynWriter,
+}
+
+#[derive(Debug, Clone)]
+struct RenderSettings {
+    width: usize,
+    min_duration: Option<Duration>,
+    types: Types,
+}
+
+impl Default for RenderSettings {
+    fn default() -> Self {
+        Self {
+            width: 120,
+            min_duration: None,
+            types: Types {
+                events: false,
+                spans: true,
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct FieldSettings {
+    field_printing: FieldFilter,
+}
+
+impl Default for FieldSettings {
+    fn default() -> Self {
+        Self {
+            field_printing: FieldFilter::DenyList(HashSet::new()),
+        }
+    }
+}
+
+impl SettingsContainer {
+    fn lock_settings(&mut self) -> &SpanSettings {
+        match self {
+            SettingsContainer::Locked(settings) => settings,
+            SettingsContainer::Unlocked(settings) => {
+                let cloned = settings.clone();
+                *self = SettingsContainer::Locked(cloned.locked());
+                self.lock_settings()
+            }
+        }
+    }
+    fn settings_mut(&mut self) -> Option<&mut Settings> {
+        match self {
+            SettingsContainer::Unlocked(settings) => Some(settings),
+            SettingsContainer::Locked(_) => None,
+        }
+    }
+}
+
+impl Default for SettingsContainer {
+    fn default() -> Self {
+        SettingsContainer::Unlocked(Settings::default())
+    }
 }
 
 /// Initialize a default subscriber and install it as the global default
@@ -624,26 +798,51 @@ pub fn init() {
     let layer = TeXRayLayer::new();
     use tracing_subscriber::layer::SubscriberExt;
     let registry = Registry::default().with(layer);
-    tracing::subscriber::set_global_default(registry).expect("failed to install subscriber");
+    set_global_default(registry).expect("failed to install subscriber");
 }
 
 impl TeXRayLayer {
-    fn _new() -> Self {
+    fn uninitialized() -> Self {
         Self {
-            tracked_spans: Default::default(),
             settings: Default::default(),
-            initialized: Arc::new(AtomicBool::new(false))
+            initialized: Arc::new(AtomicBool::new(false)),
+            tracker: Arc::new(RootTracker::new()),
         }
     }
 
     /// Create a new [`TeXRayLayer`] with settings from [`Settings::auto`]
     pub fn new() -> Self {
-        let mut dumper = DUMPER.clone();
-        dumper.initialized.store(true, std::sync::atomic::Ordering::SeqCst);
-        if !dumper.settings.updated {
-            dumper.settings = Settings::auto();
-        }
+        let dumper = GLOBAL_TEXRAY_LAYER.clone();
+        dumper.initialized.store(true, Ordering::Relaxed);
+        *dumper.settings.lock() = SettingsContainer::Unlocked(Settings::auto());
         dumper
+    }
+
+    pub(crate) fn settings_mut(&mut self) -> impl DerefMut<Target = Settings> + '_ {
+        struct DerefSettings<'a, R: RawMutex> {
+            target: MutexGuard<'a, R, SettingsContainer>,
+        }
+        impl<'a, R: RawMutex> Deref for DerefSettings<'a, R> {
+            type Target = Settings;
+
+            fn deref(&self) -> &Self::Target {
+                match self.target.deref() {
+                    SettingsContainer::Unlocked(s) => s,
+                    SettingsContainer::Locked(_s) => panic!(),
+                }
+            }
+        }
+        impl<'a, R: RawMutex> DerefMut for DerefSettings<'a, R> {
+            fn deref_mut(&mut self) -> &mut Self::Target {
+                self.target
+                    .deref_mut()
+                    .settings_mut()
+                    .expect("cannot modify settings when already in progress")
+            }
+        }
+        DerefSettings {
+            target: self.settings.lock(),
+        }
     }
 
     /// Install [`TexRayLayer`] as the global default
@@ -653,16 +852,10 @@ impl TeXRayLayer {
         set_global_default(registry).expect("failed to install subscriber")
     }
 
-    fn settings(&self) -> &Settings {
-        &self.settings
-    }
-
     /// Show events in output in addition to spans
-    pub fn enable_events(self) -> Self {
-        Self {
-            settings: self.settings.enable_events(),
-            ..self
-        }
+    pub fn enable_events(mut self) -> Self {
+        self.settings_mut().set_enable_events(true);
+        self
     }
 
     /// Override the rendered width
@@ -670,73 +863,62 @@ impl TeXRayLayer {
     /// By default, the width is loaded by inspecting the TTY. If a TTY is not available,
     /// it defaults to 120
     pub fn width(mut self, width: usize) -> Self {
-        self.settings.width = width;
+        self.settings_mut().width = width;
         self
     }
 
     /// When printing spans & events, only render the following fields
     pub fn only_show_fields(mut self, fields: &[&'static str]) -> Self {
-        self.settings = self.settings.only_show_fields(fields);
+        self.settings_mut().only_show_fields(fields);
         self
     }
 
     /// Only render spans longer than `duration`
     pub fn min_duration(mut self, duration: Duration) -> Self {
-        self.settings = self.settings.min_duration(duration);
+        self.settings_mut().min_duration(duration);
         self
-    }
-
-    /// Create a [`TexRayLayer`] from specific settings
-    pub fn with_settings(settings: Settings) -> Self {
-        let mut layer = Self::_new();
-        layer.configure(settings);
-        layer
     }
 
     /// Update the settings of this [`TexRayLayer`]
-    pub fn update_settings(mut self, f: impl Fn(Settings) -> Settings) -> Self {
-        self.settings = f(self.settings);
+    pub fn update_settings(mut self, f: impl FnOnce(&mut Settings) -> &mut Settings) -> Self {
+        // TODO: assert!(self.tracked_spans_v2.is_empty());
+        f(self.settings_mut().deref_mut());
         self
     }
 
-    fn configure(&mut self, settings: Settings) {
-        self.settings = settings;
-        self.settings.updated = true;
+    /// Updates the `writer` used to dump output
+    pub fn writer(self, writer: impl Write + Send + 'static) -> Self {
+        self.update_settings(move |s| s.writer(writer))
     }
 
-    fn for_relevant_trackers<'a, S>(
+    fn for_tracker<'a, S>(
         &self,
-        span: &span::Id,
+        span: &Id,
         ctx: &Context<'a, S>,
-        f: impl Fn(&mut SpanTracker, tracing_subscriber::registry::Scope<'_, S>),
+        f: impl Fn(&mut InterestTracker, Vec<Id>),
     ) where
         S: Subscriber + for<'span> LookupSpan<'span> + Send + Sync,
     {
-
-        if let Some(mut span_iter) = ctx.span_scope(span) {
-            let trackers = self.tracked_spans.read();
-            if span_iter.any(|span| trackers.contains_key(&span.id())) {
-                drop(trackers);
-                let mut trackers = self.tracked_spans.write();
-                let span_iter = ctx.span_scope(span).expect("span scope exists, loaded above");
-                for span_ref in span_iter {
-                    if let Some(span_tracker) = trackers.get_mut(&span_ref.id()) {
-                        f(span_tracker, ctx.span_scope(span).unwrap())
-                    }
-                }
-            }
+        if let Some(path) = ctx.span_scope(span) {
+            self.tracker
+                .if_interested(path.from_root().map(|s| s.id()), |tracker, path| {
+                    f(tracker, path)
+                });
         }
     }
 
-    fn dump_on_exit(&self, span: &Span, settings: Option<Settings>) {
-        if !self.initialized.load(atomic::Ordering::Relaxed) {
-            return
-        }
+    fn dump_on_exit(&self, span: &Span, settings: Option<SpanSettings>) {
+        check_initialized!(self);
         if let Some(id) = span.id() {
-            self.tracked_spans
-                .write()
-                .insert(id.clone(), SpanTracker::new(id, settings));
+            self.tracker.register_interest(
+                id,
+                settings.unwrap_or(self.settings.lock().lock_settings().clone()),
+            );
         }
+    }
+
+    fn initialized(&self) -> bool {
+        self.initialized.load(Ordering::Relaxed)
     }
 }
 
@@ -754,7 +936,7 @@ fn pretty_duration(duration: Duration) -> String {
         return "0ns".to_string();
     }
     for (unit, div) in divisors {
-        if nanos / div > 1 {
+        if nanos / div >= 1 {
             return format!("{}{}", nanos / div, unit);
         }
     }
@@ -766,68 +948,74 @@ where
     S: Subscriber + for<'span> LookupSpan<'span> + Send + Sync,
 {
     fn on_new_span(&self, attrs: &Attributes<'_>, id: &Id, ctx: Context<'_, S>) {
-        if !self.initialized.load(atomic::Ordering::Relaxed) {
-            return
-        }
-        self.for_relevant_trackers(id, &ctx, |tracker, scope| {
-            tracker.record_metadata(id, tracker.path(scope), attrs)
-        })
-    }
-
-    fn on_record(&self, id: &Id, values: &Record<'_>, ctx: Context<'_, S>) {
-        if !self.initialized.load(atomic::Ordering::Relaxed) {
-            return
-        }
-        self.for_relevant_trackers(id, &ctx, |tracker, scope| {
-            tracker.record_metadata(id, tracker.path(scope), values);
+        check_initialized!(self);
+        self.for_tracker(id, &ctx, |tracker, path| {
+            tracker.new_span(path.clone()).record_metadata(attrs);
         });
     }
 
+    fn on_record(&self, id: &Id, values: &Record<'_>, ctx: Context<'_, S>) {
+        check_initialized!(self);
+        self.for_tracker(id, &ctx, |tracker, path| {
+            tracker.record_metadata(&path, values)
+        })
+    }
+
     fn on_event(&self, event: &TracingEvent<'_>, ctx: Context<'_, S>) {
-        if !self.initialized.load(atomic::Ordering::Relaxed) {
-            return
-        }
+        check_initialized!(self);
         if let Some(span) = ctx.current_span().id() {
-            let mut metadata = TrackedMetadata::default();
-            event.record(&mut metadata);
-            let tracked_event = EventInfo {
-                timestamp: SystemTime::now(),
-                metadata,
-            };
-            self.for_relevant_trackers(span, &ctx, |tracker, scope| {
-                tracker.add_event(span, tracker.path(scope), tracked_event.clone())
-            })
+            self.for_tracker(span, &ctx, |tracker, path| {
+                let mut metadata = TrackedMetadata::default();
+
+                event.record(&mut FieldFilterTracked {
+                    field_filter: &tracker.field_settings.field_printing,
+                    tracked_metadata: &mut metadata,
+                });
+                let tracked_event = EventInfo {
+                    timestamp: SystemTime::now(),
+                    metadata,
+                };
+                tracker.add_event(&path, tracked_event);
+            });
         }
     }
 
     fn on_enter(&self, id: &Id, ctx: Context<'_, S>) {
-        if !self.initialized.load(atomic::Ordering::Relaxed) {
-            return
-        }
-        self.for_relevant_trackers(id, &ctx, |tracker, scope| {
-            tracker.open(id, tracker.path(scope), SpanInfo::for_span(id, &ctx));
+        check_initialized!(self);
+        self.for_tracker(id, &ctx, |tracker, path| {
+            tracker.open(path, SpanInfo::for_span(id, &ctx));
         });
     }
 
     fn on_close(&self, id: Id, ctx: Context<'_, S>) {
-        if !self.initialized.load(atomic::Ordering::Relaxed) {
-            return
-        }
-        self.for_relevant_trackers(&id, &ctx, |tracker, scope| {
-            tracker.exit(&id, tracker.path(scope), SystemTime::now())
+        check_initialized!(self);
+        self.for_tracker(&id, &ctx, |tracker, path| {
+            tracker.exit(&path, SystemTime::now());
+            if self.tracker.root_span_ids.contains(id.into_non_zero_u64()) {
+                /*let _ = tracker
+                .dump()
+                .map_err(|err| eprintln!("failed to dump output: {}", err));*/
+            }
         });
-        if let Some(tracker) = self.tracked_spans.read().get(&id) {
-            let _ = tracker.dump(self.settings());
-        }
     }
 }
 
 #[cfg(test)]
 mod test {
-    use crate::{width, Settings, SpanInfo, SpanTracker, TrackedMetadata};
-    use std::iter;
+    use crate::{
+        width, DynWriter, FieldSettings, InterestTracker, RenderSettings, Settings, SpanInfo,
+        TrackedMetadata,
+    };
+    use std::io::{BufWriter, Write};
+
+    use std::mem::take;
+
     use std::ops::Add;
+    use std::sync::Arc;
+
+    use parking_lot::Mutex;
     use std::time::{Duration, UNIX_EPOCH};
+
     use tracing::Id;
 
     #[test]
@@ -848,84 +1036,79 @@ mod test {
         assert_eq!(width(120, total, partial), 91);
     }
 
-    fn validate_output(max_width: usize, output: &str) {
-        for line in output.lines() {
-            assert!(
-                line.chars().count() <= max_width,
-                "`{}` was too long ({} > {})",
-                line,
-                line.chars().count(),
-                max_width
-            )
-        }
-    }
-
-    fn dump_to_string(tracker: &SpanTracker) -> String {
-        let mut out = vec![];
+    fn dump_to_string(id: Id, f: impl Fn(&mut InterestTracker)) -> String {
         let settings = Settings::default();
-        tracker.dump_to(&mut out, &settings).unwrap();
-        String::from_utf8(out.clone()).unwrap()
+        let settings = RenderSettings {
+            width: settings.width,
+            min_duration: settings.min_duration,
+            types: settings.types,
+        };
+        let (writer, buf) = DynWriter::str();
+        let mut tracker = InterestTracker::new(id, settings, FieldSettings::default(), writer);
+        f(&mut tracker);
+        tracker.dump().unwrap();
+        let mut buf = buf.lock();
+        buf.flush().unwrap();
+        String::from_utf8(take(buf.get_mut())).unwrap()
     }
 
     #[test]
     fn render_metadata() {
         let metadata = TrackedMetadata {
-            data: vec![("A".to_string(), "B".to_string()), ("c".to_string(), "d".to_string())]
+            data: vec![("A", "B".to_string()), ("c", "d".to_string())],
         };
         let mut out = String::new();
-        metadata.write(&mut out, &Settings::default()).unwrap();
+        metadata.write(&mut out, &FieldSettings::default()).unwrap();
         assert_eq!(out, "{A: B, c: d}");
     }
 
     #[test]
     fn render_empty_metadata() {
-        let metadata = TrackedMetadata {
-            data: vec![]
-        };
+        let metadata = TrackedMetadata { data: vec![] };
         let mut out = String::new();
-        metadata.write(&mut out, &Settings::default()).unwrap();
+        metadata.write(&mut out, &FieldSettings::default()).unwrap();
         assert_eq!(out, "");
+    }
+
+    impl DynWriter {
+        fn str() -> (DynWriter, Arc<Mutex<BufWriter<Vec<u8>>>>) {
+            let buf = Arc::new(Mutex::new(BufWriter::new(vec![])));
+            (DynWriter { inner: buf.clone() }, buf)
+        }
     }
 
     #[test]
     fn render_correct_output() {
-        let id_0 = Id::from_u64(1);
-        let id_1 = Id::from_u64(2);
-        let mut tracker = SpanTracker::new(id_0.clone(), None);
-        let interval_start = UNIX_EPOCH;
-        let interval_end = UNIX_EPOCH.add(Duration::from_secs(10));
-        tracker.open(
-            &id_0,
-            iter::empty(),
-            SpanInfo {
-                name: "test",
-                start: interval_start,
-                end: None,
-            },
-        );
-        {
+        fn id(i: u64) -> Id {
+            Id::from_u64(i)
+        }
+        let output = dump_to_string(id(1), |tracker| {
+            let interval_start = UNIX_EPOCH;
+            let interval_end = UNIX_EPOCH.add(Duration::from_secs(10));
+            tracker.new_span(vec![id(1)]);
+            tracker.new_span(vec![id(1), id(2)]);
             tracker.open(
-                &id_1,
-                &mut [id_1.clone()].iter().cloned(),
+                vec![id(1)],
+                SpanInfo {
+                    name: "test",
+                    start: interval_start,
+                    end: None,
+                },
+            );
+            tracker.open(
+                vec![id(1), id(2)],
                 SpanInfo {
                     name: "nested",
                     start: interval_start + Duration::from_secs(2),
                     end: None,
                 },
             );
-            tracker.exit(
-                &id_1,
-                &mut [id_1.clone()].iter().cloned(),
-                interval_start + Duration::from_secs(7),
-            );
-        }
-        tracker.exit(&id_0, iter::empty(), interval_end);
-        let settings = Settings::default();
-        let output = dump_to_string(&tracker);
+            tracker.exit(&[id(1), id(2)], interval_start + Duration::from_secs(7));
+            tracker.exit(&[id(1)], interval_end);
+        });
         assert_eq!(output, r#"
 test       10s  ├──────────────────────────────────────────────────────────────────────────────────────────────────────┤
   nested    5s                       ├──────────────────────────────────────────────────┤
 "#.trim_start());
-        validate_output(settings.width, &output);
     }
 }

@@ -1,3 +1,4 @@
+use crate::test_util::CaptureWriter;
 use std::time::Duration;
 use tracing::info_span;
 use tracing_subscriber::layer::SubscriberExt;
@@ -5,7 +6,12 @@ use tracing_texray::TeXRayLayer;
 
 #[tokio::test]
 async fn test_me() {
-    let layer = TeXRayLayer::new().width(80).enable_events();
+    env_logger::init();
+    let capture_writer = CaptureWriter::stdout();
+    let layer = TeXRayLayer::new()
+        .width(80)
+        .enable_events()
+        .update_settings(|s| s.writer(capture_writer.clone()));
     let registry = tracing_subscriber::registry().with(layer);
     tracing::subscriber::set_global_default(registry).expect("failed to install subscriber");
     tracing_texray::examine(info_span!("load_data")).in_scope(|| {
@@ -27,13 +33,21 @@ async fn test_me() {
     for _ in 0..5 {
         tokio::spawn(async {
             somewhere_deep_in_my_program();
-        }).await.unwrap();
+        })
+        .await
+        .unwrap();
     }
+
+    assert!(
+        capture_writer.to_string().contains(">buzz"),
+        "event not received! {}",
+        capture_writer.to_string()
+    );
 }
 
 fn somewhere_deep_in_my_program() {
     tracing_texray::examine(info_span!("do_a_thing")).in_scope(|| {
-        for id in 0..5 {
+        for id in 0..50000 {
             some_other_function(id);
         }
     })
@@ -42,4 +56,42 @@ fn somewhere_deep_in_my_program() {
 fn some_other_function(id: usize) {
     info_span!("inner_task", id = %id).in_scope(|| tracing::info!("buzz"));
     // ...
+}
+
+mod test_util {
+    use parking_lot::Mutex;
+    use std::io::{stdout, Write};
+    use std::sync::Arc;
+
+    #[derive(Clone)]
+    pub struct CaptureWriter {
+        inner: Arc<Mutex<dyn Write + Send>>,
+        data: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl CaptureWriter {
+        pub fn to_string(&self) -> String {
+            std::str::from_utf8(self.data.lock().as_ref())
+                .expect("invalid characters")
+                .to_string()
+        }
+
+        pub fn stdout() -> Self {
+            CaptureWriter {
+                inner: Arc::new(Mutex::new(stdout())),
+                data: Default::default(),
+            }
+        }
+    }
+
+    impl Write for CaptureWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.data.lock().extend(buf);
+            self.inner.lock().write(buf)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.inner.lock().flush()
+        }
+    }
 }
