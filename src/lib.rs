@@ -499,6 +499,12 @@ pub struct TeXRayLayer {
     tracker: Arc<RootTracker>,
 }
 
+impl Default for TeXRayLayer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[derive(Debug)]
 struct RootTracker {
     root_span_ids: TrackedSpans,
@@ -539,8 +545,9 @@ impl InterestTracker {
     }
 
     fn record_metadata(&mut self, path: &[Id], fields: &dyn RecordFields) {
-        if let Some(s) = self.children
-            .get_mut(path) { s.record_metadata(fields) }
+        if let Some(s) = self.children.get_mut(path) {
+            s.record_metadata(fields)
+        }
     }
 
     #[track_caller]

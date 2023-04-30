@@ -46,7 +46,7 @@ fn test_me() {
     assert!(
         capture_writer.to_string().contains(">buzz"),
         "event not received! {}",
-        capture_writer.to_string()
+        capture_writer
     );
 }
 

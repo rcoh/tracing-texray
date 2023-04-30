@@ -44,9 +44,11 @@ impl TrackedSpans {
             if old_val == value {
                 return Some(false);
             }
-            if (old_val == 0 || old_val == TOMBSTONE) && atomic
+            if (old_val == 0 || old_val == TOMBSTONE)
+                && atomic
                     .compare_exchange(old_val, value, Ordering::Relaxed, Ordering::Relaxed)
-                    .is_ok() {
+                    .is_ok()
+            {
                 return Some(true);
             }
             attempt += 1;
@@ -100,12 +102,12 @@ mod test {
     #[test]
     fn values_can_be_inserted() {
         let set = TrackedSpans::new(1024);
-        assert_eq!(set.contains(nz(5)), false);
+        assert!(!set.contains(nz(5)));
         set.insert(nz(5));
-        assert_eq!(set.contains(nz(5)), true);
+        assert!(set.contains(nz(5)));
         assert_eq!(set.insert(nz(5)), Some(false));
         assert_eq!(set.insert(nz(1234)), Some(true));
-        assert_eq!(set.contains(nz(1234)), true);
+        assert!(set.contains(nz(1234)));
     }
 
     use proptest::prelude::*;
@@ -119,7 +121,7 @@ mod test {
                 check.insert(v);
             }
             for v in values.iter() {
-                assert_eq!(sut.contains(nz(*v)), true);
+                assert!(sut.contains(nz(*v)));
             }
 
             for v in checks.iter() {
@@ -131,7 +133,7 @@ mod test {
                 assert_eq!(sut.contains(v), check.contains(&v.get()));
                 check.remove(&v.get());
                 sut.remove(v);
-                assert_eq!(sut.contains(v), false);
+                assert!(!sut.contains(v));
             }
         }
     }
