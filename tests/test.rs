@@ -1,8 +1,7 @@
 use crate::test_util::CaptureWriter;
 use std::time::Duration;
-use tracing::{info_span, trace_span};
+use tracing::info_span;
 use tracing_subscriber::layer::SubscriberExt;
-use tracing_subscriber::EnvFilter;
 use tracing_texray::TeXRayLayer;
 
 //#[tokio::test]
@@ -15,7 +14,7 @@ fn test_me() {
         .enable_events()
         .update_settings(|s| s.writer(capture_writer.clone()));
     let registry = tracing_subscriber::registry()
-        .with(EnvFilter::from_default_env())
+        //.with(EnvFilter::from_default_env())
         .with(layer);
     tracing::subscriber::set_global_default(registry).expect("failed to install subscriber");
     tracing_texray::examine(info_span!("load_data")).in_scope(|| {
@@ -63,7 +62,7 @@ fn somewhere_deep_in_my_program() {
 }
 
 fn some_other_function(id: usize) {
-    trace_span!("inner_task", id = %id).in_scope(|| tracing::info!("buzz"));
+    info_span!("inner_task", id = %id).in_scope(|| tracing::info!("buzz"));
     // ...
 }
 

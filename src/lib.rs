@@ -1,4 +1,4 @@
-#![doc = include_str ! ("../README.md")]
+#![doc = include_str!("../README.md")]
 #![warn(
     missing_docs,
     rustdoc::missing_crate_level_docs,
@@ -608,8 +608,7 @@ impl InterestTracker {
             width: settings.width,
         };
         let mut ordered = self.children.iter().collect::<Vec<_>>();
-        ordered
-            .sort_by_key(|(key, _)| sort_key(&self.children, key.as_slice()).collect::<Vec<_>>());
+        ordered.sort_by_key(|(key, _)| sort_key(&self.children, key.as_slice()));
 
         for (key, track) in ordered.iter() {
             let offset = NESTED_EVENT_OFFSET * (key.len() - 1);
@@ -716,19 +715,14 @@ impl RootTracker {
     }
 }
 
-fn sort_key(
-    map: &HashMap<Vec<Id>, SpanTracker>,
-    target: &[Id],
-) -> impl Iterator<Item = SystemTime> {
-    if target.is_empty() {
-        Box::new(std::iter::empty()) as Box<dyn Iterator<Item = SystemTime>>
-    } else {
-        let span = map.get(target).expect("missing");
-        Box::new(
-            std::iter::once(span.info.as_ref().unwrap().start)
-                .chain(sort_key(map, &target[..target.len() - 1])),
-        )
-    }
+fn sort_key<'a>(map: &'a HashMap<Vec<Id>, SpanTracker>, target: &'a [Id]) -> Vec<SystemTime> {
+    (1..=target.len())
+        .rev()
+        .map(move |idx| {
+            let span = map.get(&target[..idx]).expect("must exist");
+            span.info.as_ref().expect("span must have opened").start
+        })
+        .collect::<Vec<_>>()
 }
 
 #[derive(Debug)]

@@ -3,6 +3,7 @@ use std::num::NonZeroU64;
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
+/// Lock-free hashset that can hold a fixed number of U64s
 pub(crate) struct TrackedSpans {
     els: Vec<AtomicU64>,
 }
