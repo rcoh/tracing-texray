@@ -539,9 +539,8 @@ impl InterestTracker {
     }
 
     fn record_metadata(&mut self, path: &[Id], fields: &dyn RecordFields) {
-        self.children
-            .get_mut(path)
-            .map(|s| s.record_metadata(fields));
+        if let Some(s) = self.children
+            .get_mut(path) { s.record_metadata(fields) }
     }
 
     #[track_caller]

@@ -1,6 +1,6 @@
 use std::fmt::{Debug, Formatter};
 use std::num::NonZeroU64;
-use std::process::id;
+
 use std::sync::atomic::{AtomicU64, Ordering};
 
 pub(crate) struct TrackedSpans {
@@ -44,13 +44,10 @@ impl TrackedSpans {
             if old_val == value {
                 return Some(false);
             }
-            if old_val == 0 || old_val == TOMBSTONE {
-                if atomic
+            if (old_val == 0 || old_val == TOMBSTONE) && atomic
                     .compare_exchange(old_val, value, Ordering::Relaxed, Ordering::Relaxed)
-                    .is_ok()
-                {
-                    return Some(true);
-                }
+                    .is_ok() {
+                return Some(true);
             }
             attempt += 1;
         }
@@ -58,7 +55,7 @@ impl TrackedSpans {
     }
 
     pub(crate) fn contains(&self, value: NonZeroU64) -> bool {
-        self.idx(value) != None
+        self.idx(value).is_some()
     }
 
     fn idx(&self, value: NonZeroU64) -> Option<usize> {

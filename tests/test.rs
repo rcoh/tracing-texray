@@ -69,6 +69,7 @@ fn some_other_function(id: usize) {
 
 mod test_util {
     use parking_lot::Mutex;
+    use std::fmt::{Display, Formatter};
     use std::io::{stdout, Write};
     use std::sync::Arc;
 
@@ -78,13 +79,17 @@ mod test_util {
         data: Arc<Mutex<Vec<u8>>>,
     }
 
-    impl CaptureWriter {
-        pub fn to_string(&self) -> String {
-            std::str::from_utf8(self.data.lock().as_ref())
-                .expect("invalid characters")
-                .to_string()
+    impl Display for CaptureWriter {
+        fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+            write!(
+                f,
+                "{}",
+                std::str::from_utf8(self.data.lock().as_ref()).unwrap()
+            )
         }
+    }
 
+    impl CaptureWriter {
         pub fn stdout() -> Self {
             CaptureWriter {
                 inner: Arc::new(Mutex::new(stdout())),
