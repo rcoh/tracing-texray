@@ -1,18 +1,22 @@
 use crate::test_util::CaptureWriter;
 use std::time::Duration;
-use tracing::info_span;
+use tracing::{info_span, trace_span};
 use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::EnvFilter;
 use tracing_texray::TeXRayLayer;
 
-#[tokio::test]
-async fn test_me() {
+//#[tokio::test]
+#[test]
+fn test_me() {
     env_logger::init();
     let capture_writer = CaptureWriter::stdout();
     let layer = TeXRayLayer::new()
         .width(80)
         .enable_events()
         .update_settings(|s| s.writer(capture_writer.clone()));
-    let registry = tracing_subscriber::registry().with(layer);
+    let registry = tracing_subscriber::registry()
+        .with(EnvFilter::from_default_env())
+        .with(layer);
     tracing::subscriber::set_global_default(registry).expect("failed to install subscriber");
     tracing_texray::examine(info_span!("load_data")).in_scope(|| {
         std::thread::sleep(Duration::from_millis(20));
@@ -30,12 +34,13 @@ async fn test_me() {
         })
     });
 
-    for _ in 0..5 {
-        tokio::spawn(async {
+    for _ in 0..2 {
+        somewhere_deep_in_my_program();
+        /*tokio::spawn(async {
             somewhere_deep_in_my_program();
         })
         .await
-        .unwrap();
+        .unwrap();*/
     }
 
     assert!(
@@ -46,15 +51,19 @@ async fn test_me() {
 }
 
 fn somewhere_deep_in_my_program() {
+    for id in 10..500000 {
+        some_other_function(id);
+    }
+    //some_other_function(1000000);
     tracing_texray::examine(info_span!("do_a_thing")).in_scope(|| {
-        for id in 0..50000 {
+        for id in 0..5 {
             some_other_function(id);
         }
-    })
+    });
 }
 
 fn some_other_function(id: usize) {
-    info_span!("inner_task", id = %id).in_scope(|| tracing::info!("buzz"));
+    trace_span!("inner_task", id = %id).in_scope(|| tracing::info!("buzz"));
     // ...
 }
 

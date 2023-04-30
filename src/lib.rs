@@ -15,12 +15,12 @@ use std::borrow::Cow;
 use parking_lot::lock_api::{MutexGuard, RawMutex};
 use std::collections::{HashMap, HashSet};
 use std::fmt::{Debug, Formatter};
-use std::io;
 use std::io::{stderr, Write};
 use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
+use std::{io, iter};
 
 use tracing::field::{Field, Visit};
 use tracing::span::{Attributes, Record};
@@ -208,7 +208,7 @@ impl SpanInfo {
         write!(out, "{:width$}", key, width = truncated_key_width)?;
         write!(
             out,
-            " {:>dur_width$}",
+            " {:>dur_width$} ",
             pretty_duration(span_len),
             dur_width = DURATION_WIDTH
         )?;
@@ -531,6 +531,7 @@ impl InterestTracker {
     }
 
     fn new_span(&mut self, path: Vec<Id>) -> &mut SpanTracker {
+        debug_assert!(!path.is_empty());
         let settings = self.field_settings.clone();
         self.children
             .entry(path)
@@ -544,22 +545,23 @@ impl InterestTracker {
     }
 
     #[track_caller]
-    fn span(&mut self, path: &[Id]) -> &mut SpanTracker {
+    fn span(&mut self, path: Vec<Id>) -> &mut SpanTracker {
+        debug_assert!(!path.is_empty());
         let settings = self.field_settings.clone();
         self.children
-            .entry(path.to_vec())
+            .entry(path)
             .or_insert_with(|| SpanTracker::new(settings))
     }
 
     fn open(&mut self, path: Vec<Id>, span_info: SpanInfo) {
-        self.span(&path).open(span_info);
+        self.span(path).open(span_info);
     }
 
-    fn add_event(&mut self, path: &[Id], event: EventInfo) {
+    fn add_event(&mut self, path: Vec<Id>, event: EventInfo) {
         self.span(path).add_event(event);
     }
 
-    fn exit(&mut self, path: &[Id], timestamp: SystemTime) {
+    fn exit(&mut self, path: Vec<Id>, timestamp: SystemTime) {
         self.span(path).exit(timestamp);
     }
 
@@ -691,16 +693,17 @@ impl RootTracker {
     fn if_interested<T>(
         &self,
         ids: impl Iterator<Item = Id>,
-        f: impl Fn(&mut InterestTracker, Vec<Id>) -> T,
+        f: impl Fn(&mut InterestTracker, &mut dyn Iterator<Item = Id>) -> T,
     ) -> Option<T> {
-        let mut iter = ids
-            .skip_while(|id| !self.root_span_ids.contains(id.into_non_zero_u64()))
-            .peekable();
-        if let Some(root) = iter.peek() {
-            let root = root.clone();
-            let iter = iter.collect();
+        let mut iter = ids.skip_while(|id| !self.root_span_ids.contains(id.into_non_zero_u64()));
+        if let Some(root) = iter.next() {
+            assert!(self.root_span_ids.contains(root.into_non_zero_u64()));
             let mut tracker = self.span_metadata.write();
-            Some(f(tracker.get_mut(&root).expect("must exist"), iter))
+            let mut with_root = iter::once(root.clone()).chain(iter);
+            Some(f(
+                tracker.get_mut(&root).expect("must exist"),
+                &mut with_root,
+            ))
         } else {
             None
         }
@@ -902,7 +905,7 @@ impl TeXRayLayer {
         if let Some(path) = ctx.span_scope(span) {
             self.tracker
                 .if_interested(path.from_root().map(|s| s.id()), |tracker, path| {
-                    f(tracker, path)
+                    f(tracker, path.collect::<Vec<_>>())
                 });
         }
     }
@@ -950,7 +953,7 @@ where
     fn on_new_span(&self, attrs: &Attributes<'_>, id: &Id, ctx: Context<'_, S>) {
         check_initialized!(self);
         self.for_tracker(id, &ctx, |tracker, path| {
-            tracker.new_span(path.clone()).record_metadata(attrs);
+            tracker.new_span(path).record_metadata(attrs);
         });
     }
 
@@ -975,7 +978,7 @@ where
                     timestamp: SystemTime::now(),
                     metadata,
                 };
-                tracker.add_event(&path, tracked_event);
+                tracker.add_event(path, tracked_event);
             });
         }
     }
@@ -990,11 +993,11 @@ where
     fn on_close(&self, id: Id, ctx: Context<'_, S>) {
         check_initialized!(self);
         self.for_tracker(&id, &ctx, |tracker, path| {
-            tracker.exit(&path, SystemTime::now());
-            if self.tracker.root_span_ids.contains(id.into_non_zero_u64()) {
-                /*let _ = tracker
-                .dump()
-                .map_err(|err| eprintln!("failed to dump output: {}", err));*/
+            tracker.exit(path, SystemTime::now());
+            if self.tracker.root_span_ids.remove(id.into_non_zero_u64()) {
+                let _ = tracker
+                    .dump()
+                    .map_err(|err| eprintln!("failed to dump output: {}", err));
             }
         });
     }
@@ -1103,8 +1106,8 @@ mod test {
                     end: None,
                 },
             );
-            tracker.exit(&[id(1), id(2)], interval_start + Duration::from_secs(7));
-            tracker.exit(&[id(1)], interval_end);
+            tracker.exit(vec![id(1), id(2)], interval_start + Duration::from_secs(7));
+            tracker.exit(vec![id(1)], interval_end);
         });
         assert_eq!(output, r#"
 test       10s  ├──────────────────────────────────────────────────────────────────────────────────────────────────────┤
