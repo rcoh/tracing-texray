@@ -6,7 +6,7 @@ use std::fmt::Debug;
 use std::io::Write;
 use std::ops::DerefMut;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::{io, iter};
 use tracing::field::{Field, Visit};
 use tracing::{Id, Subscriber};
@@ -146,10 +146,9 @@ impl SpanInfo {
         let offset = width(
             render_conf.chart_width(),
             render_conf.total(),
-            match ev_start_ts.duration_since(render_conf.start_ts) {
-                Ok(dur) => dur,
-                Err(_) => return Ok(()),
-            },
+            ev_start_ts
+                .duration_since(render_conf.start_ts)
+                .unwrap_or_default(),
         );
         write!(out, "{}", " ".repeat(offset))?;
         let interval_width = width(render_conf.chart_width(), render_conf.total(), span_len);
@@ -407,7 +406,9 @@ impl InterestTracker {
             let event_offset = (width(
                 render_conf.chart_width(),
                 render_conf.total(),
-                ev.timestamp.duration_since(span_info.start).unwrap(),
+                ev.timestamp
+                    .duration_since(span_info.start)
+                    .unwrap_or_default(),
             ) as i32)
                 - 1;
             write!(out, "{}", " ".repeat(DURATION_WIDTH + 2))?;
@@ -434,11 +435,13 @@ impl RootTracker {
     }
 
     pub(crate) fn register_interest(&self, id: Id, settings: SpanSettings) {
+        // put the insertion into examined_spans inside the critical block
+        let mut span_guard = self.span_metadata.write();
         if self.examined_spans.insert(id.into_non_zero_u64()).is_err() {
             tracing::warn!("map is full, too many spans. this span will not be tracked");
             return;
         }
-        self.span_metadata.write().insert(
+        span_guard.insert(
             id.clone(),
             InterestTracker::new(id, settings.render, settings.fields, settings.out),
         );
@@ -454,10 +457,12 @@ impl RootTracker {
             assert!(self.examined_spans.contains(root.into_non_zero_u64()));
             let mut tracker = self.span_metadata.write();
             let mut with_root = iter::once(root.clone()).chain(iter);
-            Some(f(
-                tracker.get_mut(&root).expect("must exist"),
-                &mut with_root,
-            ))
+            if let Some(span_tracker) = tracker.get_mut(&root) {
+                Some(f(span_tracker, &mut with_root))
+            } else {
+                eprintln!("This is a bug–span tracker could not be found");
+                None
+            }
         } else {
             None
         }
@@ -468,8 +473,13 @@ fn sort_key<'a>(map: &'a HashMap<Vec<Id>, SpanTracker>, target: &'a [Id]) -> Vec
     (1..=target.len())
         .rev()
         .map(move |idx| {
-            let span = map.get(&target[..idx]).expect("must exist");
-            span.info.as_ref().expect("span must have opened").start
+            map.get(&target[..idx])
+                .and_then(|span| span.info.as_ref())
+                .map(|info| info.start)
+                .unwrap_or_else(|| {
+                    eprintln!("could not find span or span start—this is a bug;");
+                    UNIX_EPOCH
+                })
         })
         .collect::<Vec<_>>()
 }
