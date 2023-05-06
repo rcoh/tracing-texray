@@ -6,7 +6,7 @@ use std::fmt::Debug;
 use std::io::Write;
 use std::ops::DerefMut;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::{io, iter};
 use tracing::field::{Field, Visit};
 use tracing::{Id, Subscriber};
@@ -457,10 +457,12 @@ impl RootTracker {
             assert!(self.examined_spans.contains(root.into_non_zero_u64()));
             let mut tracker = self.span_metadata.write();
             let mut with_root = iter::once(root.clone()).chain(iter);
-            Some(f(
-                tracker.get_mut(&root).expect("must exist"),
-                &mut with_root,
-            ))
+            if let Some(span_tracker) = tracker.get_mut(&root) {
+                Some(f(span_tracker, &mut with_root))
+            } else {
+                eprintln!("This is a bug–span tracker could not be found");
+                None
+            }
         } else {
             None
         }
@@ -471,8 +473,13 @@ fn sort_key<'a>(map: &'a HashMap<Vec<Id>, SpanTracker>, target: &'a [Id]) -> Vec
     (1..=target.len())
         .rev()
         .map(move |idx| {
-            let span = map.get(&target[..idx]).expect("must exist");
-            span.info.as_ref().expect("span must have opened").start
+            map.get(&target[..idx])
+                .and_then(|span| span.info.as_ref())
+                .map(|info| info.start)
+                .unwrap_or_else(|| {
+                    eprintln!("could not find span or span start—this is a bug;");
+                    UNIX_EPOCH
+                })
         })
         .collect::<Vec<_>>()
 }
