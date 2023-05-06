@@ -146,10 +146,9 @@ impl SpanInfo {
         let offset = width(
             render_conf.chart_width(),
             render_conf.total(),
-            match ev_start_ts.duration_since(render_conf.start_ts) {
-                Ok(dur) => dur,
-                Err(_) => return Ok(()),
-            },
+            ev_start_ts
+                .duration_since(render_conf.start_ts)
+                .unwrap_or_default(),
         );
         write!(out, "{}", " ".repeat(offset))?;
         let interval_width = width(render_conf.chart_width(), render_conf.total(), span_len);
@@ -407,7 +406,9 @@ impl InterestTracker {
             let event_offset = (width(
                 render_conf.chart_width(),
                 render_conf.total(),
-                ev.timestamp.duration_since(span_info.start).unwrap(),
+                ev.timestamp
+                    .duration_since(span_info.start)
+                    .unwrap_or_default(),
             ) as i32)
                 - 1;
             write!(out, "{}", " ".repeat(DURATION_WIDTH + 2))?;
@@ -434,11 +435,13 @@ impl RootTracker {
     }
 
     pub(crate) fn register_interest(&self, id: Id, settings: SpanSettings) {
+        // put the insertion into examined_spans inside the critical block
+        let mut span_guard = self.span_metadata.write();
         if self.examined_spans.insert(id.into_non_zero_u64()).is_err() {
             tracing::warn!("map is full, too many spans. this span will not be tracked");
             return;
         }
-        self.span_metadata.write().insert(
+        span_guard.insert(
             id.clone(),
             InterestTracker::new(id, settings.render, settings.fields, settings.out),
         );

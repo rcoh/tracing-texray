@@ -68,13 +68,13 @@ impl TrackedSpans {
         while attempt < self.size() {
             let idx = self.hash(value, attempt);
             let atomic = self.els.get(idx).expect("idx guaranteed to be less");
-            let old_val = atomic.load(Ordering::Relaxed);
+            let old_val = atomic.load(Ordering::SeqCst);
             if old_val == value {
                 return Ok(InsertResult::AlreadyPresent);
             }
             if (old_val == 0 || old_val == TOMBSTONE)
                 && atomic
-                    .compare_exchange(old_val, value, Ordering::Relaxed, Ordering::Relaxed)
+                    .compare_exchange(old_val, value, Ordering::SeqCst, Ordering::SeqCst)
                     .is_ok()
             {
                 return Ok(InsertResult::NotPresent);
@@ -94,7 +94,7 @@ impl TrackedSpans {
         while attempt < self.size() {
             let idx = self.hash(value, attempt);
             let atomic = self.els.get(idx).expect("idx guaranteed to be less");
-            let stored_value = atomic.load(Ordering::SeqCst);
+            let stored_value = atomic.load(Ordering::Acquire);
             match stored_value {
                 0 => return None,
                 v if v == value => return Some(idx),
@@ -112,7 +112,7 @@ impl TrackedSpans {
                 _ => TOMBSTONE,
             };
             self.els[idx]
-                .compare_exchange(value.get(), new_value, Ordering::Relaxed, Ordering::Relaxed)
+                .compare_exchange(value.get(), new_value, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
         } else {
             false
