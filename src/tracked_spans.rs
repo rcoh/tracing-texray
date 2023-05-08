@@ -47,6 +47,10 @@ impl TrackedSpans {
         Self { els: storage }
     }
 
+    fn tombstone_nel(&self) -> usize {
+        self.els.len() - 1
+    }
+
     fn hash(&self, value: u64, attempt: usize) -> usize {
         // to store the TOMBSTONE value, we reserve the final slot in the array to hold it,
         // if present
@@ -54,9 +58,9 @@ impl TrackedSpans {
             if attempt != 0 {
                 unreachable!("tombstone will never fail if missing")
             }
-            self.els.len() - 1
+            self.tombstone_nel()
         } else {
-            ((value + attempt as u64) % (self.els.len() as u64 - 1)) as usize
+            ((value + attempt as u64) % (self.size() as u64)) as usize
         }
     }
 
@@ -68,7 +72,7 @@ impl TrackedSpans {
     ///
     /// If the value was able to be inserted:
     /// - Some(false) will be returned if the value was already present
-    /// - Some(true) will be returne
+    /// - Some(true) will be returned
     pub(crate) fn insert(&self, value: NonZeroU64) -> Result<InsertResult, MapFull> {
         let value = value.get();
         let mut attempt = 0_usize;
@@ -92,10 +96,10 @@ impl TrackedSpans {
     }
 
     pub(crate) fn contains(&self, value: NonZeroU64) -> bool {
-        self.idx(value).is_some()
+        self.index_of(value).is_some()
     }
 
-    fn idx(&self, value: NonZeroU64) -> Option<usize> {
+    fn index_of(&self, value: NonZeroU64) -> Option<usize> {
         let value = value.get();
         let mut attempt = 0;
         while attempt < self.size() {
@@ -112,10 +116,10 @@ impl TrackedSpans {
     }
 
     pub(crate) fn remove(&self, value: NonZeroU64) -> bool {
-        if let Some(idx) = self.idx(value) {
+        if let Some(idx) = self.index_of(value) {
             // if we've already removed that value, no worries
             let new_value = match value.get() {
-                TOMBSTONE => 0,
+                TOMBSTONE if idx == self.tombstone_nel() => 0,
                 _ => TOMBSTONE,
             };
             self.els[idx]
@@ -162,6 +166,12 @@ mod test {
         set.remove(nz(1));
         set.insert(nz(1000)).expect("space now");
         assert!(set.contains(nz(1000)));
+
+        for _ in 0..1000 {
+            set.remove(nz(1000));
+            set.insert(nz(1000)).expect("space now");
+        }
+        assert!(set.contains(nz(1000)));
     }
 
     #[test]
@@ -174,6 +184,7 @@ mod test {
         set.insert(nz(TOMBSTONE)).unwrap();
         assert!(set.contains(nz(TOMBSTONE)));
         assert!(set.remove(nz(TOMBSTONE)));
+        assert!(!set.remove(nz(TOMBSTONE)));
         assert!(!set.contains(nz(TOMBSTONE)));
     }
 
