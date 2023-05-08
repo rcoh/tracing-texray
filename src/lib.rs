@@ -27,6 +27,7 @@ use tracing::span::{Attributes, Record};
 use tracing::subscriber::set_global_default;
 use tracing::{Event as TracingEvent, Id, Span, Subscriber};
 
+use crate::tracker::Action;
 use tracing_subscriber::layer::Context;
 use tracing_subscriber::registry::LookupSpan;
 use tracing_subscriber::{Layer, Registry};
@@ -412,15 +413,18 @@ impl TeXRayLayer {
         &self,
         span: &Id,
         ctx: &Context<'a, S>,
-        f: impl Fn(&mut InterestTracker, Vec<Id>),
-    ) where
+        f: impl Fn(&mut InterestTracker, Vec<Id>) -> Action,
+    ) -> Option<InterestTracker>
+    where
         S: Subscriber + for<'span> LookupSpan<'span> + Send + Sync,
     {
         if let Some(path) = ctx.span_scope(span) {
             self.tracker
                 .if_interested(path.from_root().map(|s| s.id()), |tracker, path| {
                     f(tracker, path.collect::<Vec<_>>())
-                });
+                })
+        } else {
+            None
         }
     }
 
@@ -468,14 +472,16 @@ where
         check_initialized!(self);
         self.for_tracker(id, &ctx, |tracker, path| {
             tracker.new_span(path).record_metadata(attrs);
+            Action::DoNothing
         });
     }
 
     fn on_record(&self, id: &Id, values: &Record<'_>, ctx: Context<'_, S>) {
         check_initialized!(self);
         self.for_tracker(id, &ctx, |tracker, path| {
-            tracker.record_metadata(&path, values)
-        })
+            tracker.record_metadata(&path, values);
+            Action::DoNothing
+        });
     }
 
     fn on_event(&self, event: &TracingEvent<'_>, ctx: Context<'_, S>) {
@@ -487,6 +493,7 @@ where
                 event.record(&mut tracker.field_recorder(&mut metadata));
                 let tracked_event = EventInfo::now(metadata);
                 tracker.add_event(path, tracked_event);
+                Action::DoNothing
             });
         }
     }
@@ -495,18 +502,21 @@ where
         check_initialized!(self);
         self.for_tracker(id, &ctx, |tracker, path| {
             tracker.open(path, SpanInfo::for_span(id, &ctx));
+            Action::DoNothing
         });
     }
 
     fn on_close(&self, id: Id, ctx: Context<'_, S>) {
         check_initialized!(self);
-        self.for_tracker(&id, &ctx, |tracker, path| {
+        if let Some(removed_tracker) = self.for_tracker(&id, &ctx, |tracker, path| {
             tracker.exit(path, SystemTime::now());
             if self.tracker.end_tracking(id.clone()) {
-                let _ = tracker
-                    .dump()
-                    .map_err(|err| eprintln!("failed to dump output: {}", err));
+                Action::ForgetSpan
+            } else {
+                Action::DoNothing
             }
-        });
+        }) {
+            let _ = removed_tracker.dump();
+        }
     }
 }
