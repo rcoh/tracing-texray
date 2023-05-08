@@ -1,7 +1,14 @@
 use std::fmt::{Debug, Formatter};
 use std::num::NonZeroU64;
+use sync::{AtomicU64, Ordering};
 
-use std::sync::atomic::{AtomicU64, Ordering};
+mod sync {
+    #[cfg(loom)]
+    pub(crate) use loom::sync::atomic::{AtomicU64, Ordering};
+
+    #[cfg(not(loom))]
+    pub(crate) use std::sync::atomic::{AtomicU64, Ordering};
+}
 
 /// Lock-free hashset that can hold a fixed number of U64s
 ///
@@ -68,13 +75,13 @@ impl TrackedSpans {
         while attempt < self.size() {
             let idx = self.hash(value, attempt);
             let atomic = self.els.get(idx).expect("idx guaranteed to be less");
-            let old_val = atomic.load(Ordering::SeqCst);
+            let old_val = atomic.load(Ordering::Relaxed);
             if old_val == value {
                 return Ok(InsertResult::AlreadyPresent);
             }
             if (old_val == 0 || old_val == TOMBSTONE)
                 && atomic
-                    .compare_exchange(old_val, value, Ordering::SeqCst, Ordering::SeqCst)
+                    .compare_exchange(old_val, value, Ordering::AcqRel, Ordering::Relaxed)
                     .is_ok()
             {
                 return Ok(InsertResult::NotPresent);
@@ -94,7 +101,7 @@ impl TrackedSpans {
         while attempt < self.size() {
             let idx = self.hash(value, attempt);
             let atomic = self.els.get(idx).expect("idx guaranteed to be less");
-            let stored_value = atomic.load(Ordering::Acquire);
+            let stored_value = atomic.load(Ordering::Relaxed);
             match stored_value {
                 0 => return None,
                 v if v == value => return Some(idx),
@@ -170,7 +177,57 @@ mod test {
         assert!(!set.contains(nz(TOMBSTONE)));
     }
 
+    #[test]
+    #[cfg(loom)]
+    fn test_concurrent_usage() {
+        let collection_size = 3;
+        tracing_subscriber::fmt::init();
+        loom::model(move || {
+            let tracked_spans = loom::sync::Arc::new(TrackedSpans::new(collection_size));
+            let second_structure = loom::sync::Arc::new(loom::sync::RwLock::new(HashSet::new()));
+            let mut threads = vec![];
+            for t in 0..2 {
+                let thread_copy = tracked_spans.clone();
+                let map_copy = second_structure.clone();
+                threads.push(loom::thread::spawn(move || {
+                    let mut range: Box<dyn Iterator<Item = u64>> = Box::new(1..10);
+                    if t % 2 == 0 {
+                        range = Box::new((1..10).rev());
+                    }
+                    for i in range.take(2) {
+                        if thread_copy.contains(nz(i)) {
+                            assert!(map_copy.read().unwrap().contains(&i));
+                        }
+                        let mut guard = map_copy.write().unwrap();
+                        guard.insert(i);
+                        drop(guard);
+                        if thread_copy.insert(nz(i)).is_ok() {
+                            assert!(thread_copy.contains(nz(i)));
+                        }
+                    }
+                }));
+            }
+            let thread_copy = tracked_spans.clone();
+            let map_copy = second_structure.clone();
+            threads.push(loom::thread::spawn(move || {
+                for i in 1..5 {
+                    if thread_copy.contains(nz(i)) {
+                        assert!(map_copy.read().unwrap().contains(&i));
+                    }
+                }
+            }));
+            for handle in threads {
+                handle.join().unwrap();
+            }
+            assert_eq!(
+                (1..10).filter(|i| tracked_spans.contains(nz(*i))).count(),
+                collection_size - 1
+            );
+        })
+    }
+
     use proptest::prelude::*;
+
     proptest! {
         #[test]
         fn test_insertion(values in prop::collection::vec(1..u64::MAX, 1..100), checks in prop::collection::vec(1..u64::MAX, 1..1000)) {

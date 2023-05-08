@@ -17,6 +17,12 @@ use tracing_subscriber::registry::LookupSpan;
 const NESTED_EVENT_OFFSET: usize = 2;
 const DURATION_WIDTH: usize = 6;
 
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub(crate) enum Action {
+    ForgetSpan,
+    DoNothing,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct EventInfo {
     timestamp: SystemTime,
@@ -430,6 +436,7 @@ impl RootTracker {
         }
     }
 
+    /// Returns true if this span was tracked
     pub(crate) fn end_tracking(&self, id: Id) -> bool {
         self.examined_spans.remove(id.into_non_zero_u64())
     }
@@ -447,25 +454,25 @@ impl RootTracker {
         );
     }
 
-    pub(crate) fn if_interested<T>(
+    pub(crate) fn if_interested(
         &self,
         ids: impl Iterator<Item = Id>,
-        f: impl Fn(&mut InterestTracker, &mut dyn Iterator<Item = Id>) -> T,
-    ) -> Option<T> {
+        f: impl Fn(&mut InterestTracker, &mut dyn Iterator<Item = Id>) -> Action,
+    ) -> Option<InterestTracker> {
         let mut iter = ids.skip_while(|id| !self.examined_spans.contains(id.into_non_zero_u64()));
         if let Some(root) = iter.next() {
             assert!(self.examined_spans.contains(root.into_non_zero_u64()));
             let mut tracker = self.span_metadata.write();
             let mut with_root = iter::once(root.clone()).chain(iter);
             if let Some(span_tracker) = tracker.get_mut(&root) {
-                Some(f(span_tracker, &mut with_root))
+                if f(span_tracker, &mut with_root) == Action::ForgetSpan {
+                    return tracker.remove(&root);
+                }
             } else {
                 eprintln!("This is a bug–span tracker could not be found");
-                None
             }
-        } else {
-            None
         }
+        None
     }
 }
 
